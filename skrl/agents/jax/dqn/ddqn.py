@@ -106,7 +106,7 @@ class DDQN(Agent):
         device: Optional[Union[str, jax.Device]] = None,
         cfg: Optional[dict] = None,
     ) -> None:
-        """Double Deep Q-Network (DDQN)
+        """Double Deep Q-Network (DDQN).
 
         https://ojs.aaai.org/index.php/AAAI/article/view/10295
 
@@ -118,7 +118,7 @@ class DDQN(Agent):
         :param device: Data allocation and computation device. If not specified, the default device will be used.
         :param cfg: Agent's configuration.
 
-        :raises KeyError: If the models dictionary is missing a required key
+        :raises KeyError: If a configuration key is missing.
         """
         # _cfg = copy.deepcopy(DDQN_DEFAULT_CONFIG)  # TODO: TypeError: cannot pickle 'jax.Device' object
         _cfg = DDQN_DEFAULT_CONFIG

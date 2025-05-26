@@ -74,7 +74,7 @@ class A2C(Agent):
         device: Optional[Union[str, torch.device]] = None,
         cfg: Optional[dict] = None,
     ) -> None:
-        """Advantage Actor Critic (A2C)
+        """Advantage Actor Critic (A2C).
 
         https://arxiv.org/abs/1602.01783
 
@@ -86,7 +86,7 @@ class A2C(Agent):
         :param device: Data allocation and computation device. If not specified, the default device will be used.
         :param cfg: Agent's configuration.
 
-        :raises KeyError: If the models dictionary is missing a required key
+        :raises KeyError: If a configuration key is missing.
         """
         _cfg = copy.deepcopy(A2C_DEFAULT_CONFIG)
         _cfg.update(cfg if cfg is not None else {})

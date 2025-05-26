@@ -74,7 +74,7 @@ class DQN(Agent):
         device: Optional[Union[str, torch.device]] = None,
         cfg: Optional[dict] = None,
     ) -> None:
-        """Deep Q-Network (DQN)
+        """Deep Q-Network (DQN).
 
         https://arxiv.org/abs/1312.5602
 
@@ -86,7 +86,7 @@ class DQN(Agent):
         :param device: Data allocation and computation device. If not specified, the default device will be used.
         :param cfg: Agent's configuration.
 
-        :raises KeyError: If the models dictionary is missing a required key
+        :raises KeyError: If a configuration key is missing.
         """
         _cfg = copy.deepcopy(DQN_DEFAULT_CONFIG)
         _cfg.update(cfg if cfg is not None else {})

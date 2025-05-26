@@ -82,7 +82,7 @@ class RPO(Agent):
         device: Optional[Union[str, torch.device]] = None,
         cfg: Optional[dict] = None,
     ) -> None:
-        """Robust Policy Optimization (RPO)
+        """Robust Policy Optimization (RPO).
 
         https://arxiv.org/abs/2212.07536
 
@@ -94,7 +94,7 @@ class RPO(Agent):
         :param device: Data allocation and computation device. If not specified, the default device will be used.
         :param cfg: Agent's configuration.
 
-        :raises KeyError: If the models dictionary is missing a required key
+        :raises KeyError: If a configuration key is missing.
         """
         _cfg = copy.deepcopy(RPO_DEFAULT_CONFIG)
         _cfg.update(cfg if cfg is not None else {})

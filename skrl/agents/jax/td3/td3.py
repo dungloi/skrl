@@ -153,7 +153,7 @@ class TD3(Agent):
         device: Optional[Union[str, jax.Device]] = None,
         cfg: Optional[dict] = None,
     ) -> None:
-        """Twin Delayed DDPG (TD3)
+        """Twin Delayed DDPG (TD3).
 
         https://arxiv.org/abs/1802.09477
 
@@ -165,7 +165,7 @@ class TD3(Agent):
         :param device: Data allocation and computation device. If not specified, the default device will be used.
         :param cfg: Agent's configuration.
 
-        :raises KeyError: If the models dictionary is missing a required key
+        :raises KeyError: If a configuration key is missing.
         """
         # _cfg = copy.deepcopy(TD3_DEFAULT_CONFIG)  # TODO: TypeError: cannot pickle 'jax.Device' object
         _cfg = TD3_DEFAULT_CONFIG

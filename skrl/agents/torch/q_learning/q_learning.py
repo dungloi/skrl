@@ -50,7 +50,7 @@ class Q_LEARNING(Agent):
         device: Optional[Union[str, torch.device]] = None,
         cfg: Optional[dict] = None,
     ) -> None:
-        """Q-learning
+        """Q-learning.
 
         https://www.academia.edu/3294050/Learning_from_delayed_rewards
 
@@ -62,7 +62,7 @@ class Q_LEARNING(Agent):
         :param device: Data allocation and computation device. If not specified, the default device will be used.
         :param cfg: Agent's configuration.
 
-        :raises KeyError: If the models dictionary is missing a required key
+        :raises KeyError: If a configuration key is missing.
         """
         _cfg = copy.deepcopy(Q_LEARNING_DEFAULT_CONFIG)
         _cfg.update(cfg if cfg is not None else {})

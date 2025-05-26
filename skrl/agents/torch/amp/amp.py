@@ -97,12 +97,13 @@ class AMP(Agent):
         collect_reference_motions: Optional[Callable[[int], torch.Tensor]] = None,
         collect_observation: Optional[Callable[[], torch.Tensor]] = None,
     ) -> None:
-        """Adversarial Motion Priors (AMP)
+        """Adversarial Motion Priors (AMP).
 
         https://arxiv.org/abs/2104.02180
 
-        The implementation is adapted from the NVIDIA IsaacGymEnvs
-        (https://github.com/isaac-sim/IsaacGymEnvs/blob/main/isaacgymenvs/learning/amp_continuous.py)
+        .. note::
+
+            The implementation is adapted from the NVIDIA IsaacGymEnvs repository.
 
         :param models: Agent's models.
         :param memory: Memory to storage agent's data and environment transitions.
@@ -117,7 +118,7 @@ class AMP(Agent):
         :param collect_reference_motions: Callable to collect reference motions.
         :param collect_observation: Callable to collect AMP observations.
 
-        :raises KeyError: If the models dictionary is missing a required key
+        :raises KeyError: If a configuration key is missing.
         """
         _cfg = copy.deepcopy(AMP_DEFAULT_CONFIG)
         _cfg.update(cfg if cfg is not None else {})

@@ -50,7 +50,7 @@ class SARSA(Agent):
         device: Optional[Union[str, torch.device]] = None,
         cfg: Optional[dict] = None,
     ) -> None:
-        """State Action Reward State Action (SARSA)
+        """State Action Reward State Action (SARSA).
 
         https://scholar.google.com/scholar?q=On-line+Q-learning+using+connectionist+system
 
@@ -62,7 +62,7 @@ class SARSA(Agent):
         :param device: Data allocation and computation device. If not specified, the default device will be used.
         :param cfg: Agent's configuration.
 
-        :raises KeyError: If the models dictionary is missing a required key
+        :raises KeyError: If a configuration key is missing.
         """
         _cfg = copy.deepcopy(SARSA_DEFAULT_CONFIG)
         _cfg.update(cfg if cfg is not None else {})

@@ -77,7 +77,7 @@ class TRPO(Agent):
         device: Optional[Union[str, torch.device]] = None,
         cfg: Optional[dict] = None,
     ) -> None:
-        """Trust Region Policy Optimization (TRPO)
+        """Trust Region Policy Optimization (TRPO).
 
         https://arxiv.org/abs/1502.05477
 
@@ -89,7 +89,7 @@ class TRPO(Agent):
         :param device: Data allocation and computation device. If not specified, the default device will be used.
         :param cfg: Agent's configuration.
 
-        :raises KeyError: If the models dictionary is missing a required key
+        :raises KeyError: If a configuration key is missing.
         """
         _cfg = copy.deepcopy(TRPO_DEFAULT_CONFIG)
         _cfg.update(cfg if cfg is not None else {})

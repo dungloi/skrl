@@ -75,7 +75,7 @@ class SAC(Agent):
         device: Optional[Union[str, torch.device]] = None,
         cfg: Optional[dict] = None,
     ) -> None:
-        """Soft Actor-Critic (SAC)
+        """Soft Actor-Critic (SAC).
 
         https://arxiv.org/abs/1801.01290
 
@@ -87,7 +87,7 @@ class SAC(Agent):
         :param device: Data allocation and computation device. If not specified, the default device will be used.
         :param cfg: Agent's configuration.
 
-        :raises KeyError: If the models dictionary is missing a required key
+        :raises KeyError: If a configuration key is missing.
         """
         _cfg = copy.deepcopy(SAC_DEFAULT_CONFIG)
         _cfg.update(cfg if cfg is not None else {})

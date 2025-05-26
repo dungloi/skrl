@@ -81,7 +81,7 @@ class PPO(Agent):
         device: Optional[Union[str, torch.device]] = None,
         cfg: Optional[dict] = None,
     ) -> None:
-        """Proximal Policy Optimization (PPO)
+        """Proximal Policy Optimization (PPO).
 
         https://arxiv.org/abs/1707.06347
 
@@ -93,7 +93,7 @@ class PPO(Agent):
         :param device: Data allocation and computation device. If not specified, the default device will be used.
         :param cfg: Agent's configuration.
 
-        :raises KeyError: If the models dictionary is missing a required key
+        :raises KeyError: If a configuration key is missing.
         """
         _cfg = copy.deepcopy(PPO_DEFAULT_CONFIG)
         _cfg.update(cfg if cfg is not None else {})

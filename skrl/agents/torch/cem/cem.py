@@ -63,7 +63,7 @@ class CEM(Agent):
         device: Optional[Union[str, torch.device]] = None,
         cfg: Optional[dict] = None,
     ) -> None:
-        """Cross-Entropy Method (CEM)
+        """Cross-Entropy Method (CEM).
 
         https://ieeexplore.ieee.org/abstract/document/6796865/
 
@@ -75,7 +75,7 @@ class CEM(Agent):
         :param device: Data allocation and computation device. If not specified, the default device will be used.
         :param cfg: Agent's configuration.
 
-        :raises KeyError: If the models dictionary is missing a required key
+        :raises KeyError: If a configuration key is missing.
         """
         _cfg = copy.deepcopy(CEM_DEFAULT_CONFIG)
         _cfg.update(cfg if cfg is not None else {})
