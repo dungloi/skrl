@@ -1,4 +1,4 @@
-from typing import Any, Mapping, Optional, Tuple, Union
+from typing import Any, Mapping, Optional, Union
 
 import copy
 import functools
@@ -94,10 +94,12 @@ def _update_q_network(
 class DQN(Agent):
     def __init__(
         self,
-        models: Mapping[str, Model],
-        memory: Optional[Union[Memory, Tuple[Memory]]] = None,
-        observation_space: Optional[Union[int, Tuple[int], gymnasium.Space]] = None,
-        action_space: Optional[Union[int, Tuple[int], gymnasium.Space]] = None,
+        *,
+        models: Optional[Mapping[str, Model]] = None,
+        memory: Optional[Memory] = None,
+        observation_space: Optional[gymnasium.Space] = None,
+        state_space: Optional[gymnasium.Space] = None,
+        action_space: Optional[gymnasium.Space] = None,
         device: Optional[Union[str, jax.Device]] = None,
         cfg: Optional[dict] = None,
     ) -> None:
@@ -105,21 +107,13 @@ class DQN(Agent):
 
         https://arxiv.org/abs/1312.5602
 
-        :param models: Models used by the agent
-        :type models: dictionary of skrl.models.jax.Model
-        :param memory: Memory to storage the transitions.
-                       If it is a tuple, the first element will be used for training and
-                       for the rest only the environment transitions will be added
-        :type memory: skrl.memory.jax.Memory, list of skrl.memory.jax.Memory or None
-        :param observation_space: Observation/state space or shape (default: ``None``)
-        :type observation_space: int, tuple or list of int, gymnasium.Space or None, optional
-        :param action_space: Action space or shape (default: ``None``)
-        :type action_space: int, tuple or list of int, gymnasium.Space or None, optional
-        :param device: Device on which a tensor/array is or will be allocated (default: ``None``).
-                       If None, the device will be either ``"cuda"`` if available or ``"cpu"``
-        :type device: str or jax.Device, optional
-        :param cfg: Configuration dictionary
-        :type cfg: dict
+        :param models: Agent's models.
+        :param memory: Memory to storage agent's data and environment transitions.
+        :param observation_space: Observation space.
+        :param state_space: State space.
+        :param action_space: Action space.
+        :param device: Data allocation and computation device. If not specified, the default device will be used.
+        :param cfg: Agent's configuration.
 
         :raises KeyError: If the models dictionary is missing a required key
         """
@@ -323,15 +317,6 @@ class DQN(Agent):
                 terminated=terminated,
                 truncated=truncated,
             )
-            for memory in self.secondary_memories:
-                memory.add_samples(
-                    states=states,
-                    actions=actions,
-                    rewards=rewards,
-                    next_states=next_states,
-                    terminated=terminated,
-                    truncated=truncated,
-                )
 
     def pre_interaction(self, timestep: int, timesteps: int) -> None:
         """Callback called before the interaction with the environment

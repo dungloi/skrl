@@ -1,10 +1,11 @@
-from typing import Any, Mapping, Optional, Tuple, Union
+from typing import Any, Mapping, Optional, Union
 
 import collections
 import copy
 import datetime
 import os
 import pickle
+from abc import ABC, abstractmethod
 import gymnasium
 
 import flax
@@ -16,55 +17,46 @@ from skrl.memories.jax import Memory
 from skrl.models.jax import Model
 
 
-class Agent:
+class Agent(ABC):
     def __init__(
         self,
-        models: Mapping[str, Model],
-        memory: Optional[Union[Memory, Tuple[Memory]]] = None,
-        observation_space: Optional[Union[int, Tuple[int], gymnasium.Space]] = None,
-        action_space: Optional[Union[int, Tuple[int], gymnasium.Space]] = None,
+        *,
+        models: Optional[Mapping[str, Model]] = None,
+        memory: Optional[Memory] = None,
+        observation_space: Optional[gymnasium.Space] = None,
+        state_space: Optional[gymnasium.Space] = None,
+        action_space: Optional[gymnasium.Space] = None,
         device: Optional[Union[str, jax.Device]] = None,
         cfg: Optional[dict] = None,
     ) -> None:
-        """Base class that represent a RL agent
+        """Base class that represent a RL agent/algorithm.
 
-        :param models: Models used by the agent
-        :type models: dictionary of skrl.models.jax.Model
-        :param memory: Memory to storage the transitions.
-                       If it is a tuple, the first element will be used for training and
-                       for the rest only the environment transitions will be added
-        :type memory: skrl.memory.jax.Memory, list of skrl.memory.jax.Memory or None
-        :param observation_space: Observation/state space or shape (default: ``None``)
-        :type observation_space: int, tuple or list of int, gymnasium.Space or None, optional
-        :param action_space: Action space or shape (default: ``None``)
-        :type action_space: int, tuple or list of int, gymnasium.Space or None, optional
-        :param device: Device on which a tensor/array is or will be allocated (default: ``None``).
-                       If None, the device will be either ``"cuda"`` if available or ``"cpu"``
-        :type device: str or jax.Device, optional
-        :param cfg: Configuration dictionary
-        :type cfg: dict
+        :param models: Agent's models.
+        :param memory: Memory to storage agent's data and environment transitions.
+        :param observation_space: Observation space.
+        :param state_space: State space.
+        :param action_space: Action space.
+        :param device: Data allocation and computation device. If not specified, the default device will be used.
+        :param cfg: Agent's configuration.
         """
         self._jax = config.jax.backend == "jax"
+        self.training = True
 
         self.models = models
+        self.memory = memory
         self.observation_space = observation_space
+        self.state_space = state_space
         self.action_space = action_space
         self.cfg = cfg if cfg is not None else {}
 
         self.device = config.jax.parse_device(device)
-
-        if type(memory) is list:
-            self.memory = memory[0]
-            self.secondary_memories = memory[1:]
-        else:
-            self.memory = memory
-            self.secondary_memories = []
 
         # convert the models to their respective device
         for model in self.models.values():
             if model is not None:
                 pass
 
+        # data tracking
         self.tracking_data = collections.defaultdict(list)
         self.write_interval = self.cfg.get("experiment", {}).get("write_interval", "auto")
 
@@ -72,8 +64,6 @@ class Agent:
         self._track_timesteps = collections.deque(maxlen=100)
         self._cumulative_rewards = None
         self._cumulative_timesteps = None
-
-        self.training = True
 
         # checkpoint
         self.checkpoint_modules = {}
