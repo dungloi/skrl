@@ -1,4 +1,4 @@
-from typing import Any, Callable, Mapping, Optional, Tuple, Union
+from typing import Any, Callable, Mapping, Optional, Union
 
 import copy
 import itertools
@@ -83,13 +83,15 @@ AMP_DEFAULT_CONFIG = {
 class AMP(Agent):
     def __init__(
         self,
-        models: Mapping[str, Model],
-        memory: Optional[Union[Memory, Tuple[Memory]]] = None,
-        observation_space: Optional[Union[int, Tuple[int], gymnasium.Space]] = None,
-        action_space: Optional[Union[int, Tuple[int], gymnasium.Space]] = None,
+        *,
+        models: Optional[Mapping[str, Model]] = None,
+        memory: Optional[Memory] = None,
+        observation_space: Optional[gymnasium.Space] = None,
+        state_space: Optional[gymnasium.Space] = None,
+        action_space: Optional[gymnasium.Space] = None,
         device: Optional[Union[str, torch.device]] = None,
         cfg: Optional[dict] = None,
-        amp_observation_space: Optional[Union[int, Tuple[int], gymnasium.Space]] = None,
+        amp_observation_space: Optional[gymnasium.Space] = None,
         motion_dataset: Optional[Memory] = None,
         reply_buffer: Optional[Memory] = None,
         collect_reference_motions: Optional[Callable[[int], torch.Tensor]] = None,
@@ -102,31 +104,18 @@ class AMP(Agent):
         The implementation is adapted from the NVIDIA IsaacGymEnvs
         (https://github.com/isaac-sim/IsaacGymEnvs/blob/main/isaacgymenvs/learning/amp_continuous.py)
 
-        :param models: Models used by the agent
-        :type models: dictionary of skrl.models.torch.Model
-        :param memory: Memory to storage the transitions.
-                       If it is a tuple, the first element will be used for training and
-                       for the rest only the environment transitions will be added
-        :type memory: skrl.memory.torch.Memory, list of skrl.memory.torch.Memory or None
-        :param observation_space: Observation/state space or shape (default: ``None``)
-        :type observation_space: int, tuple or list of int, gymnasium.Space or None, optional
-        :param action_space: Action space or shape (default: ``None``)
-        :type action_space: int, tuple or list of int, gymnasium.Space or None, optional
-        :param device: Device on which a tensor/array is or will be allocated (default: ``None``).
-                       If None, the device will be either ``"cuda"`` if available or ``"cpu"``
-        :type device: str or torch.device, optional
-        :param cfg: Configuration dictionary
-        :type cfg: dict
-        :param amp_observation_space: AMP observation/state space or shape (default: ``None``)
-        :type amp_observation_space: int, tuple or list of int, gymnasium.Space or None
-        :param motion_dataset: Reference motion dataset: M (default: ``None``)
-        :type motion_dataset: skrl.memory.torch.Memory or None
-        :param reply_buffer: Reply buffer for preventing discriminator overfitting: B (default: ``None``)
-        :type reply_buffer: skrl.memory.torch.Memory or None
-        :param collect_reference_motions: Callable to collect reference motions (default: ``None``)
-        :type collect_reference_motions: Callable[[int], torch.Tensor] or None
-        :param collect_observation: Callable to collect observation (default: ``None``)
-        :type collect_observation: Callable[[], torch.Tensor] or None
+        :param models: Agent's models.
+        :param memory: Memory to storage agent's data and environment transitions.
+        :param observation_space: Observation space.
+        :param state_space: State space.
+        :param action_space: Action space.
+        :param device: Data allocation and computation device. If not specified, the default device will be used.
+        :param cfg: Agent's configuration.
+        :param amp_observation_space: AMP observation space.
+        :param motion_dataset: Reference motion dataset (M).
+        :param reply_buffer: Reply buffer for preventing discriminator overfitting (B).
+        :param collect_reference_motions: Callable to collect reference motions.
+        :param collect_observation: Callable to collect AMP observations.
 
         :raises KeyError: If the models dictionary is missing a required key
         """
@@ -406,19 +395,6 @@ class AMP(Agent):
                 amp_states=amp_states,
                 next_values=next_values,
             )
-            for memory in self.secondary_memories:
-                memory.add_samples(
-                    states=states,
-                    actions=actions,
-                    rewards=rewards,
-                    next_states=next_states,
-                    terminated=terminated,
-                    truncated=truncated,
-                    log_prob=self._current_log_prob,
-                    values=values,
-                    amp_states=amp_states,
-                    next_values=next_values,
-                )
 
     def pre_interaction(self, timestep: int, timesteps: int) -> None:
         """Callback called before the interaction with the environment
