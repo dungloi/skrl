@@ -186,7 +186,34 @@ class MAPPO(MultiAgent):
         self.optimizers = {}
         self.schedulers = {}
 
-        for uid in self.possible_agents:
+        # check if shared policy is used
+        # (i.e. all agents share the same policy and value networks)
+        shared_policy = False
+        if hasattr(self, "cfg") and "models" in self.cfg and "shared_policy" in self.cfg["models"]:
+            shared_policy = self.cfg["models"]["shared_policy"]
+        
+        if shared_policy:
+            # optimizer and scheduler for shared policy
+            uid0 = self.possible_agents[0]
+            policy = self.policies[uid0]
+            value = self.values[uid0]
+            if policy is not None and value is not None:
+                if policy is value:
+                    optimizer = torch.optim.Adam(policy.parameters(), lr=self._learning_rate[uid0])
+                else:
+                    optimizer = torch.optim.Adam(
+                        itertools.chain(policy.parameters(), value.parameters()), lr=self._learning_rate[uid0]
+                    )
+                for uid in self.possible_agents:
+                    self.optimizers[uid] = optimizer
+                    if self._learning_rate_scheduler[uid] is not None:
+                        self.schedulers[uid] = self._learning_rate_scheduler[uid](
+                            optimizer, **self._learning_rate_scheduler_kwargs[uid]
+                        )
+                    self.checkpoint_modules[uid]["optimizer"] = optimizer
+        else:
+            # check if all policies are the same
+            for uid in self.possible_agents:
             policy = self.policies[uid]
             value = self.values[uid]
             if policy is not None and value is not None:
