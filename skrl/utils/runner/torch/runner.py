@@ -227,8 +227,15 @@ class Runner:
             except KeyError:
                 separate = True
                 logger.warning("No 'separate' field defined in 'models' cfg. Defining it as True by default")
+            # [xdl] get shared policy configuration and remove 'shared_policy' key    
+            try:
+                shared_policy = models_cfg["shared_policy"]
+                del models_cfg["shared_policy"]
+            except KeyError:
+                shared_policy = False
+                logger.warning("No 'shared_policy' field defined in 'models' cfg. Defining it as False by default")
 
-            # [xdl] check for shared policy models
+            # check for shared policy models
             if shared_policy:
                 if not shared_policy_models:
                     # non-shared models

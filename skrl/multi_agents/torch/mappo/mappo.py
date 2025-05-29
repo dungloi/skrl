@@ -191,7 +191,7 @@ class MAPPO(MultiAgent):
         shared_policy = False
         if hasattr(self, "cfg") and "models" in self.cfg and "shared_policy" in self.cfg["models"]:
             shared_policy = self.cfg["models"]["shared_policy"]
-        
+
         if shared_policy:
             # optimizer and scheduler for shared policy
             uid0 = self.possible_agents[0]
@@ -214,43 +214,43 @@ class MAPPO(MultiAgent):
         else:
             # check if all policies are the same
             for uid in self.possible_agents:
-            policy = self.policies[uid]
-            value = self.values[uid]
-            if policy is not None and value is not None:
-                if policy is value:
-                    optimizer = torch.optim.Adam(policy.parameters(), lr=self._learning_rate[uid])
+                policy = self.policies[uid]
+                value = self.values[uid]
+                if policy is not None and value is not None:
+                    if policy is value:
+                        optimizer = torch.optim.Adam(policy.parameters(), lr=self._learning_rate[uid])
+                    else:
+                        optimizer = torch.optim.Adam(
+                            itertools.chain(policy.parameters(), value.parameters()), lr=self._learning_rate[uid]
+                        )
+                    self.optimizers[uid] = optimizer
+                    if self._learning_rate_scheduler[uid] is not None:
+                        self.schedulers[uid] = self._learning_rate_scheduler[uid](
+                            optimizer, **self._learning_rate_scheduler_kwargs[uid]
+                        )
+
+                self.checkpoint_modules[uid]["optimizer"] = self.optimizers[uid]
+
+                # set up preprocessors
+                if self._state_preprocessor[uid] is not None:
+                    self._state_preprocessor[uid] = self._state_preprocessor[uid](**self._state_preprocessor_kwargs[uid])
+                    self.checkpoint_modules[uid]["state_preprocessor"] = self._state_preprocessor[uid]
                 else:
-                    optimizer = torch.optim.Adam(
-                        itertools.chain(policy.parameters(), value.parameters()), lr=self._learning_rate[uid]
+                    self._state_preprocessor[uid] = self._empty_preprocessor
+
+                if self._shared_state_preprocessor[uid] is not None:
+                    self._shared_state_preprocessor[uid] = self._shared_state_preprocessor[uid](
+                        **self._shared_state_preprocessor_kwargs[uid]
                     )
-                self.optimizers[uid] = optimizer
-                if self._learning_rate_scheduler[uid] is not None:
-                    self.schedulers[uid] = self._learning_rate_scheduler[uid](
-                        optimizer, **self._learning_rate_scheduler_kwargs[uid]
-                    )
+                    self.checkpoint_modules[uid]["shared_state_preprocessor"] = self._shared_state_preprocessor[uid]
+                else:
+                    self._shared_state_preprocessor[uid] = self._empty_preprocessor
 
-            self.checkpoint_modules[uid]["optimizer"] = self.optimizers[uid]
-
-            # set up preprocessors
-            if self._state_preprocessor[uid] is not None:
-                self._state_preprocessor[uid] = self._state_preprocessor[uid](**self._state_preprocessor_kwargs[uid])
-                self.checkpoint_modules[uid]["state_preprocessor"] = self._state_preprocessor[uid]
-            else:
-                self._state_preprocessor[uid] = self._empty_preprocessor
-
-            if self._shared_state_preprocessor[uid] is not None:
-                self._shared_state_preprocessor[uid] = self._shared_state_preprocessor[uid](
-                    **self._shared_state_preprocessor_kwargs[uid]
-                )
-                self.checkpoint_modules[uid]["shared_state_preprocessor"] = self._shared_state_preprocessor[uid]
-            else:
-                self._shared_state_preprocessor[uid] = self._empty_preprocessor
-
-            if self._value_preprocessor[uid] is not None:
-                self._value_preprocessor[uid] = self._value_preprocessor[uid](**self._value_preprocessor_kwargs[uid])
-                self.checkpoint_modules[uid]["value_preprocessor"] = self._value_preprocessor[uid]
-            else:
-                self._value_preprocessor[uid] = self._empty_preprocessor
+                if self._value_preprocessor[uid] is not None:
+                    self._value_preprocessor[uid] = self._value_preprocessor[uid](**self._value_preprocessor_kwargs[uid])
+                    self.checkpoint_modules[uid]["value_preprocessor"] = self._value_preprocessor[uid]
+                else:
+                    self._value_preprocessor[uid] = self._empty_preprocessor
 
     def init(self, trainer_cfg: Optional[Mapping[str, Any]] = None) -> None:
         """Initialize the agent"""
