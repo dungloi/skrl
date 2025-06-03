@@ -2,7 +2,9 @@ from typing import List, Optional, Union
 
 import atexit
 import sys
+import time
 import tqdm
+from loguru import logger as logger_
 
 import torch
 
@@ -181,25 +183,38 @@ class Trainer:
         # reset env
         states, infos = self.env.reset()
 
+        sim_real_time_ratio_avg = None
+        t_compute_actions, t_step_env, t_render, t_record_transition, t_iters_per_update = 0.0, 0.0, 0.0, 0.0, 0.0
         for timestep in tqdm.tqdm(
             range(self.initial_timestep, self.timesteps), disable=self.disable_progressbar, file=sys.stdout
         ):
+            start_iteration = time.perf_counter()
 
             # pre-interaction
             self.agents.pre_interaction(timestep=timestep, timesteps=self.timesteps)
 
             with torch.no_grad():
                 # compute actions
+                start_compute_actions = time.perf_counter()
                 actions = self.agents.act(states, timestep=timestep, timesteps=self.timesteps)[0]
+                end_compute_actions = time.perf_counter()
+                t_compute_actions += end_compute_actions - start_compute_actions
 
                 # step the environments
+                start_step_env = time.perf_counter()
                 next_states, rewards, terminated, truncated, infos = self.env.step(actions)
+                end_step_env = time.perf_counter()
+                t_step_env += end_step_env - start_step_env
 
                 # render scene
                 if not self.headless:
+                    start_render = time.perf_counter()
                     self.env.render()
+                    end_render = time.perf_counter()
+                    t_render += end_render - start_render
 
                 # record the environments' transitions
+                start_record_transition = time.perf_counter()
                 self.agents.record_transition(
                     states=states,
                     actions=actions,
@@ -211,6 +226,8 @@ class Trainer:
                     timestep=timestep,
                     timesteps=self.timesteps,
                 )
+                end_record_transition = time.perf_counter()
+                t_record_transition += end_record_transition - start_record_transition
 
                 # log environment info
                 if self.environment_info in infos:
@@ -219,7 +236,10 @@ class Trainer:
                             self.agents.track_data(f"Info / {k}", v.item())
 
             # post-interaction
+            start_update = time.perf_counter()
             self.agents.post_interaction(timestep=timestep, timesteps=self.timesteps)
+            end_update = time.perf_counter()
+            t_update = end_update - start_update
 
             # reset environments
             if self.env.num_envs > 1:
@@ -230,6 +250,30 @@ class Trainer:
                         states, infos = self.env.reset()
                 else:
                     states = next_states
+
+            # runtime report
+            end_iteration = time.perf_counter()
+            t_iteration = end_iteration - start_iteration
+            t_iters_per_update += t_iteration
+            t_iteration_sim = self.env.step_dt
+            if sim_real_time_ratio_avg is None:
+                sim_real_time_ratio_avg = t_iteration_sim / t_iteration
+            else:
+                sim_real_time_ratio = t_iteration_sim / t_iteration
+                count = timestep - self.initial_timestep + 1
+                sim_real_time_ratio_avg = (sim_real_time_ratio_avg * (count - 1) + sim_real_time_ratio) / count
+
+            if not self.agents._rollout % self.agents._rollouts and (timestep - 1) >= self.agents._learning_starts:
+                logger_.info("")
+                logger_.info(f"Trainer iteration takes {t_iters_per_update:.5f}s")
+                logger_.info(f">>> Compute actions takes up {t_compute_actions / t_iters_per_update * 100:.2f}%")
+                logger_.info(f">>> Step envs takes up {t_step_env / t_iters_per_update * 100:.2f}%, {t_step_env / self.agents._rollouts:.5f}s")
+                logger_.info(f">>> Render takes up {t_render / t_iters_per_update * 100:.2f}%")
+                logger_.info(f">>> Record transitions takes up {t_record_transition / t_iters_per_update * 100:.2f}%")
+                logger_.info(f">>> Update takes up {t_update / t_iters_per_update * 100:.2f}%, {t_update:.5f}s")
+                logger_.info(f"Sim time passes {sim_real_time_ratio_avg:.2f} times faster than real time")
+                logger_.info("\n\n\n\n=========================================================================================================================================\n===================================================== Training Iteration Split Line =====================================================\n=========================================================================================================================================")
+                t_compute_actions = t_step_env = t_render = t_record_transition = t_iters_per_update = 0.0
 
     def single_agent_eval(self) -> None:
         """Evaluate agent
@@ -318,28 +362,41 @@ class Trainer:
         states, infos = self.env.reset()
         shared_states = self.env.state()
 
+        sim_real_time_ratio_avg = None
+        t_compute_actions, t_step_env, t_render, t_record_transition, t_iters_per_update = 0.0, 0.0, 0.0, 0.0, 0.0
         for timestep in tqdm.tqdm(
             range(self.initial_timestep, self.timesteps), disable=self.disable_progressbar, file=sys.stdout
         ):
+            start_iteration = time.perf_counter()
 
             # pre-interaction
             self.agents.pre_interaction(timestep=timestep, timesteps=self.timesteps)
 
             with torch.no_grad():
                 # compute actions
+                start_compute_actions = time.perf_counter()
                 actions = self.agents.act(states, timestep=timestep, timesteps=self.timesteps)[0]
+                end_compute_actions = time.perf_counter()
+                t_compute_actions += end_compute_actions - start_compute_actions
 
                 # step the environments
+                start_step_env = time.perf_counter()
                 next_states, rewards, terminated, truncated, infos = self.env.step(actions)
                 shared_next_states = self.env.state()
                 infos["shared_states"] = shared_states
                 infos["shared_next_states"] = shared_next_states
+                end_step_env = time.perf_counter()
+                t_step_env += end_step_env - start_step_env
 
                 # render scene
                 if not self.headless:
+                    start_render = time.perf_counter()
                     self.env.render()
+                    end_render = time.perf_counter()
+                    t_render += end_render - start_render
 
                 # record the environments' transitions
+                start_record_transition = time.perf_counter()
                 self.agents.record_transition(
                     states=states,
                     actions=actions,
@@ -351,6 +408,8 @@ class Trainer:
                     timestep=timestep,
                     timesteps=self.timesteps,
                 )
+                end_record_transition = time.perf_counter()
+                t_record_transition += end_record_transition - start_record_transition
 
                 # log environment info
                 if self.environment_info in infos:
@@ -359,7 +418,10 @@ class Trainer:
                             self.agents.track_data(f"Info / {k}", v.item())
 
             # post-interaction
+            start_update = time.perf_counter()
             self.agents.post_interaction(timestep=timestep, timesteps=self.timesteps)
+            end_update = time.perf_counter()
+            t_update = end_update - start_update
 
             # reset environments
             if not self.env.agents:
@@ -369,6 +431,30 @@ class Trainer:
             else:
                 states = next_states
                 shared_states = shared_next_states
+
+            # runtime report
+            end_iteration = time.perf_counter()
+            t_iteration = end_iteration - start_iteration
+            t_iters_per_update += t_iteration
+            t_iteration_sim = self.env.step_dt
+            if sim_real_time_ratio_avg is None:
+                sim_real_time_ratio_avg = t_iteration_sim / t_iteration
+            else:
+                sim_real_time_ratio = t_iteration_sim / t_iteration
+                count = timestep - self.initial_timestep + 1
+                sim_real_time_ratio_avg = (sim_real_time_ratio_avg * (count - 1) + sim_real_time_ratio) / count
+
+            if not self.agents._rollout % self.agents._rollouts and (timestep - 1) >= self.agents._learning_starts:
+                logger_.info("")
+                logger_.info(f"Trainer iteration takes {t_iters_per_update:.5f}s")
+                logger_.info(f">>> Compute actions takes up {t_compute_actions / t_iters_per_update * 100:.2f}%")
+                logger_.info(f">>> Step envs takes up {t_step_env / t_iters_per_update * 100:.2f}%, {t_step_env / self.agents._rollouts:.5f}s")
+                logger_.info(f">>> Render takes up {t_render / t_iters_per_update * 100:.2f}%")
+                logger_.info(f">>> Record transitions takes up {t_record_transition / t_iters_per_update * 100:.2f}%")
+                logger_.info(f">>> Update takes up {t_update / t_iters_per_update * 100:.2f}%, {t_update:.5f}s")
+                logger_.info(f"Sim time passes {sim_real_time_ratio_avg:.2f} times faster than real time")
+                logger_.info("\n\n\n\n=========================================================================================================================================\n===================================================== Training Iteration Split Line =====================================================\n=========================================================================================================================================")
+                t_compute_actions = t_step_env = t_render = t_record_transition = t_iters_per_update = 0.0
 
     def multi_agent_eval(self) -> None:
         """Evaluate multi-agents
