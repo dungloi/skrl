@@ -138,6 +138,8 @@ class MAPPO(MultiAgent):
                         self.values[uid].broadcast_parameters()
 
         # configuration
+        self._shared_policy = self.cfg["shared_policy"]
+
         self._learning_epochs = self._as_dict(self.cfg["learning_epochs"])
         self._mini_batches = self._as_dict(self.cfg["mini_batches"])
         self._rollouts = self.cfg["rollouts"]
@@ -186,13 +188,8 @@ class MAPPO(MultiAgent):
         self.optimizers = {}
         self.schedulers = {}
 
-        # check if shared policy is used
-        # (i.e. all agents share the same policy and value networks)
-        shared_policy = False
-        if hasattr(self, "cfg") and "models" in self.cfg and "shared_policy" in self.cfg["models"]:
-            shared_policy = self.cfg["models"]["shared_policy"]
-
-        if shared_policy:
+        # [xdl]: check if shared policy is used, set optimizers and schedulers to the same for all agents
+        if self._shared_policy:
             # optimizer and scheduler for shared policy
             uid0 = self.possible_agents[0]
             policy = self.policies[uid0]
@@ -204,13 +201,48 @@ class MAPPO(MultiAgent):
                     optimizer = torch.optim.Adam(
                         itertools.chain(policy.parameters(), value.parameters()), lr=self._learning_rate[uid0]
                     )
+                # [xdl]: depending on agent with uid0, set the learning rate schedulers for all agents
+                if self._learning_rate_scheduler[uid0] is not None:
+                    scheduler = self._learning_rate_scheduler[uid0](
+                        optimizer, **self._learning_rate_scheduler_kwargs[uid0]
+                    )
+                else:
+                    scheduler = None
                 for uid in self.possible_agents:
                     self.optimizers[uid] = optimizer
                     if self._learning_rate_scheduler[uid] is not None:
-                        self.schedulers[uid] = self._learning_rate_scheduler[uid](
-                            optimizer, **self._learning_rate_scheduler_kwargs[uid]
-                        )
+                        if scheduler is None:
+                            self.schedulers[uid] = self._learning_rate_scheduler[uid](
+                                optimizer, **self._learning_rate_scheduler_kwargs[uid]
+                            )
+                        else:
+                            self.schedulers[uid] = scheduler
                     self.checkpoint_modules[uid]["optimizer"] = optimizer
+
+                    # set up preprocessors
+                    if self._state_preprocessor[uid] is not None:
+                        self._state_preprocessor[uid] = self._state_preprocessor[uid](
+                            **self._state_preprocessor_kwargs[uid]
+                        )
+                        self.checkpoint_modules[uid]["state_preprocessor"] = self._state_preprocessor[uid]
+                    else:
+                        self._state_preprocessor[uid] = self._empty_preprocessor
+
+                    if self._shared_state_preprocessor[uid] is not None:
+                        self._shared_state_preprocessor[uid] = self._shared_state_preprocessor[uid](
+                            **self._shared_state_preprocessor_kwargs[uid]
+                        )
+                        self.checkpoint_modules[uid]["shared_state_preprocessor"] = self._shared_state_preprocessor[uid]
+                    else:
+                        self._shared_state_preprocessor[uid] = self._empty_preprocessor
+
+                    if self._value_preprocessor[uid] is not None:
+                        self._value_preprocessor[uid] = self._value_preprocessor[uid](
+                            **self._value_preprocessor_kwargs[uid]
+                        )
+                        self.checkpoint_modules[uid]["value_preprocessor"] = self._value_preprocessor[uid]
+                    else:
+                        self._value_preprocessor[uid] = self._empty_preprocessor
         else:
             # check if all policies are the same
             for uid in self.possible_agents:

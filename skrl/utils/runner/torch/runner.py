@@ -208,12 +208,12 @@ class Runner:
 
         agent_class = cfg.get("agent", {}).get("class", "").lower()
 
+        # [xdl]: check for shared policy configuration
+        shared_policy = cfg.get("agent", {}).get("shared_policy", False)
+        logger.info(f"'shared_policy' field defined as {shared_policy}")
+        shared_policy_models = {}
         # instantiate models
         models = {}
-        # xdl: check for shared policy configuration
-        shared_policy = cfg.get("models", {}).get("shared_policy", False)
-        shared_policy_models = {}
-
         for agent_id in possible_agents:
             _cfg = copy.deepcopy(cfg)
             models[agent_id] = {}
@@ -227,13 +227,6 @@ class Runner:
             except KeyError:
                 separate = True
                 logger.warning("No 'separate' field defined in 'models' cfg. Defining it as True by default")
-            # [xdl] get shared policy configuration and remove 'shared_policy' key    
-            try:
-                shared_policy = models_cfg["shared_policy"]
-                del models_cfg["shared_policy"]
-            except KeyError:
-                shared_policy = False
-                logger.warning("No 'shared_policy' field defined in 'models' cfg. Defining it as False by default")
 
             # check for shared policy models
             if shared_policy:
