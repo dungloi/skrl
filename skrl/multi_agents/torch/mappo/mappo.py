@@ -138,7 +138,7 @@ class MAPPO(MultiAgent):
                         self.values[uid].broadcast_parameters()
 
         # configuration
-        self._shared_policy = self.cfg["shared_policy"]
+        self._shared_policy = self.cfg.get("shared_policy", False)
 
         self._learning_epochs = self._as_dict(self.cfg["learning_epochs"])
         self._mini_batches = self._as_dict(self.cfg["mini_batches"])
