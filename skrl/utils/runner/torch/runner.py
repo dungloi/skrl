@@ -209,8 +209,8 @@ class Runner:
         agent_class = cfg.get("agent", {}).get("class", "").lower()
 
         # [xdl]: check for shared policy configuration
-        shared_policy = cfg.get("agent", {}).get("shared_policy", False)
-        logger.info(f"'shared_policy' field defined as {shared_policy}")
+        shared_parameters = cfg.get("agent", {}).get("shared_parameters", False)
+        logger.info(f"'shared_parameters' field defined as {shared_parameters}")
         shared_policy_models = {}
         # instantiate models
         models = {}
@@ -229,7 +229,7 @@ class Runner:
                 logger.warning("No 'separate' field defined in 'models' cfg. Defining it as True by default")
 
             # check for shared policy models
-            if shared_policy:
+            if shared_parameters:
                 if not shared_policy_models:
                     # non-shared models
                     if separate:
