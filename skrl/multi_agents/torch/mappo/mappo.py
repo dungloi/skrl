@@ -188,9 +188,8 @@ class MAPPO(MultiAgent):
         self.optimizers = {}
         self.schedulers = {}
 
-        # [xdl]: check if shared policy is used, set optimizers and schedulers to the same for all agents
         if self._shared_parameters:
-            # optimizer and scheduler for shared policy
+            # [xdl]: if parameters are shared, set optimizers and schedulers to the same for all agents
             uid0 = self.possible_agents[0]
             policy = self.policies[uid0]
             value = self.values[uid0]
@@ -201,7 +200,7 @@ class MAPPO(MultiAgent):
                     optimizer = torch.optim.Adam(
                         itertools.chain(policy.parameters(), value.parameters()), lr=self._learning_rate[uid0]
                     )
-                # [xdl]: depending on agent with uid0, set the learning rate schedulers for all agents
+                # [xdl]: set the learning rate schedulers to the same with the first agent
                 if self._learning_rate_scheduler[uid0] is not None:
                     scheduler = self._learning_rate_scheduler[uid0](
                         optimizer, **self._learning_rate_scheduler_kwargs[uid0]
@@ -507,7 +506,7 @@ class MAPPO(MultiAgent):
             return returns, advantages
 
         if self._shared_parameters:
-            # [xdl]: if shared policy is used, the agents share the same policy, value, optimizer and scheduler.
+            # [xdl]: if parameters are shared, the agents share the same policy, value, optimizer and scheduler.
             # use the first agent's uid to access
             uid0 = self.possible_agents[0]
             policy = self.policies[uid0]
@@ -570,7 +569,7 @@ class MAPPO(MultiAgent):
                             sampled_values,
                             sampled_returns,
                             sampled_advantages,
-                        ) = all_sampled_batches[uid][epoch * self._mini_batches[uid0] + minibatch_idx]
+                        ) = all_sampled_batches[uid][minibatch_idx]
 
                         with torch.autocast(device_type=self._device_type, enabled=self._mixed_precision):
                             sampled_states = self._state_preprocessor[uid](sampled_states, train=not epoch)
@@ -619,10 +618,10 @@ class MAPPO(MultiAgent):
                             value_loss = self._value_loss_scale[uid] * F.mse_loss(sampled_returns, predicted_values)
 
                         # compute value losses for all agents
-                        all_policy_loss += policy_loss
-                        all_value_loss += value_loss
+                        all_policy_loss += policy_loss / len(self.possible_agents)
+                        all_value_loss += value_loss / len(self.possible_agents)
                         if self._entropy_loss_scale[uid]:
-                            all_entropy_loss += entropy_loss
+                            all_entropy_loss += entropy_loss / len(self.possible_agents)
 
                     # optimization step for all agents
                     optimizer.zero_grad()
@@ -663,14 +662,14 @@ class MAPPO(MultiAgent):
                     else:
                         scheduler.step()
 
-            # record data for shared_parameters
+            # record data in case of shared parameters
             self.track_data(
                 f"Loss / Policy loss (shared)",
                 cumulative_all_policy_loss / (self._learning_epochs[uid0] * self._mini_batches[uid0]),
             )
             self.track_data(
                 f"Loss / Value loss (shared)",
-                cumulative_all_value_loss / (self._learning_epochs[uid0] * self._mini_batches[uid0]
+                cumulative_all_value_loss / (self._learning_epochs[uid0] * self._mini_batches[uid0]),
             )
             if self._entropy_loss_scale[uid0]:
                 self.track_data(
@@ -682,7 +681,7 @@ class MAPPO(MultiAgent):
             )
             if scheduler is not None:
                 self.track_data(f"Learning / Learning rate (shared)", scheduler.get_last_lr()[0])
-                
+
         else:
             for uid in self.possible_agents:
                 policy = self.policies[uid]
