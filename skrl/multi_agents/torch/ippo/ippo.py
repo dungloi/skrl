@@ -440,6 +440,7 @@ class IPPO(MultiAgent):
             return returns, advantages
 
         sampled_batches = {}
+        value_list, return_list = [], []
         for uid in self.possible_agents:
             value = self.values[uid]
             memory = self.memories[uid]
@@ -463,6 +464,10 @@ class IPPO(MultiAgent):
                 lambda_coefficient=self._lambda[uid],
             )
 
+            # collect values and returns before preprocessing and value clipping for explained variance
+            value_list.append(values.detach().reshape(-1))
+            return_list.append(returns.detach().reshape(-1))
+
             memory.set_tensor_by_name("values", self._value_preprocessor[uid](values, train=True))
             memory.set_tensor_by_name("returns", self._value_preprocessor[uid](returns, train=True))
             memory.set_tensor_by_name("advantages", advantages)
@@ -470,8 +475,15 @@ class IPPO(MultiAgent):
             # sample mini-batches from memory
             sampled_batches[uid] = memory.sample_all(names=self._tensors_names, mini_batches=self._mini_batches[uid])
 
-        # originate from: https://github.com/jackzeng-robotics/skrl
+        # compute explained variance
+        # adapted from https://github.com/DLR-RM/stable-baselines3
+        v_pred = torch.cat(value_list).reshape(-1)
+        v_true = torch.cat(return_list).reshape(-1)
+        var_v = torch.var(v_true, unbiased=False)
+        explained_var = float("nan") if var_v == 0 else (1 - torch.var(v_true - v_pred, unbiased=False) / var_v).item()
+
         # merge mini-batches from all agents by aligning batch indices and concatenating corresponding tensors along dim=0 into one unified list of batches
+        # adapted from https://github.com/jackzeng-robotics/skrl
         agent_0 = self.possible_agents[0]
         merged_batches = [[] for _ in range(self._mini_batches[agent_0])]
         for batch_memory in sampled_batches.values():
@@ -489,6 +501,7 @@ class IPPO(MultiAgent):
         cumulative_entropy_loss = 0
         cumulative_value_loss = 0
         cumulative_kl_divergence = 0
+        clip_fractions = []
 
         # learning epochs
         for epoch in range(self._learning_epochs[agent_0]):
@@ -534,8 +547,11 @@ class IPPO(MultiAgent):
                     surrogate_clipped = sampled_advantages * torch.clip(
                         ratio, 1.0 - self._ratio_clip[agent_0], 1.0 + self._ratio_clip[agent_0]
                     )
-
                     policy_loss = -torch.min(surrogate, surrogate_clipped).mean()
+
+                    # compute clip fraction
+                    batch_clip_fraction = (torch.abs(ratio - 1.0) > self._ratio_clip[agent_0]).float().mean()
+                    clip_fractions.append(batch_clip_fraction.detach())
 
                     # compute value loss
                     predicted_values, _, _ = value.act({"states": sampled_states}, role="value")
@@ -601,10 +617,9 @@ class IPPO(MultiAgent):
                 cumulative_entropy_loss / (self._learning_epochs[agent_0] * self._mini_batches[agent_0]),
             )
 
-        self.track_data(
-            f"Policy / Standard deviation", policy.distribution(role="policy").stddev.mean().item()
-        )
-
+        self.track_data(f"Learning / Standard deviation", policy.distribution(role="policy").stddev.mean().item())
+        self.track_data(f"Learning / Explained variance", explained_var)
+        self.track_data(f"Learning / Clip fraction", torch.stack(clip_fractions).mean().item() if clip_fractions else 0.0)
         if self._learning_rate_scheduler[agent_0]:
             self.track_data(f"Learning / Learning rate", self.schedulers[agent_0].get_last_lr()[0])
             if isinstance(self.schedulers[agent_0], KLAdaptiveLR):
