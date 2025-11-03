@@ -1,4 +1,4 @@
-from typing import Any, Mapping, Optional, Sequence, Union
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple, Union
 
 import copy
 import itertools
@@ -279,7 +279,7 @@ class MAPPO(MultiAgent):
         self._current_log_prob = []
         self._current_shared_next_states = []
 
-    def act(self, states: Mapping[str, torch.Tensor], timestep: int, timesteps: int) -> torch.Tensor:
+    def act(self, states: Mapping[str, torch.Tensor], timestep: int, timesteps: int) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], Dict[str, Any]]:
         """Process the environment's states to make a decision (actions) using the main policies
 
         :param states: Environment's states
@@ -290,7 +290,6 @@ class MAPPO(MultiAgent):
         :type timesteps: int
 
         :return: Actions
-        :rtype: torch.Tensor
         """
         # # sample random actions
         # # TODO: fix for stochasticity, rnn and log_prob
@@ -426,7 +425,6 @@ class MAPPO(MultiAgent):
             rewards: torch.Tensor,
             dones: torch.Tensor,
             values: torch.Tensor,
-            next_values: torch.Tensor,
             discount_factor: float = 0.99,
             lambda_coefficient: float = 0.95,
         ) -> torch.Tensor:
@@ -438,8 +436,6 @@ class MAPPO(MultiAgent):
             :type dones: torch.Tensor
             :param values: Values obtained by the agent
             :type values: torch.Tensor
-            :param next_values: Next values obtained by the agent
-            :type next_values: torch.Tensor
             :param discount_factor: Discount factor
             :type discount_factor: float
             :param lambda_coefficient: Lambda coefficient
@@ -490,7 +486,6 @@ class MAPPO(MultiAgent):
                 rewards=memory.get_tensor_by_name("rewards"),
                 dones=memory.get_tensor_by_name("terminated") | memory.get_tensor_by_name("truncated"),
                 values=values,
-                next_values=last_values,
                 discount_factor=self._discount_factor[uid],
                 lambda_coefficient=self._lambda[uid],
             )
@@ -513,17 +508,17 @@ class MAPPO(MultiAgent):
         var_v = torch.var(v_true, unbiased=False)
         explained_var = float("nan") if var_v == 0 else (1 - torch.var(v_true - v_pred, unbiased=False) / var_v).item()
 
-        # merge mini-batches from all agents by aligning batch indices and concatenating corresponding tensors along dim=0 into one unified list of batches
+        # merge mini-batches from all agents by concatenating along batch dimension
         # adapted from https://github.com/jackzeng-robotics/skrl
         agent_0 = self.possible_agents[0]
         merged_batches = [[] for _ in range(self._mini_batches[agent_0])]
-        for batch_memory in sampled_batches.values():
-            for batch_idx, batch in enumerate(batch_memory):
+        for uid in self.possible_agents:
+            for batch_idx, batch in enumerate(sampled_batches[uid]):
                 if not merged_batches[batch_idx]:  
-                    merged_batches[batch_idx] = list(batch)
+                    merged_batches[batch_idx] = list(batch)  # shape of batch: [batch_size, ...]
                 else:
                     for tensor_idx, tensor in enumerate(batch):
-                        merged_batches[batch_idx][tensor_idx] = torch.cat((merged_batches[batch_idx][tensor_idx], tensor), dim=0)
+                        merged_batches[batch_idx][tensor_idx] = torch.cat((merged_batches[batch_idx][tensor_idx], tensor), dim=0)   # batch dimension: dim=0
         sampled_batches_all = [tuple(batch) for batch in merged_batches]
 
         policy = self.policies[agent_0]
@@ -552,9 +547,7 @@ class MAPPO(MultiAgent):
                 with torch.autocast(device_type=self._device_type, enabled=self._mixed_precision):
 
                     sampled_states = self._state_preprocessor[agent_0](sampled_states, train=not epoch)
-                    sampled_shared_states = self._shared_state_preprocessor[agent_0](
-                        sampled_shared_states, train=not epoch
-                    )
+                    sampled_shared_states = self._shared_state_preprocessor[agent_0](sampled_shared_states, train=not epoch)
 
                     _, next_log_prob, _ = policy.act(
                         {"states": sampled_states, "taken_actions": sampled_actions}, role="policy"
@@ -591,7 +584,7 @@ class MAPPO(MultiAgent):
                     # compute value loss
                     predicted_values, _, _ = value.act({"states": sampled_shared_states}, role="value")
 
-                    if self._clip_predicted_values:
+                    if self._clip_predicted_values[agent_0]:
                         predicted_values = sampled_values + torch.clip(
                             predicted_values - sampled_values, min=-self._value_clip[agent_0], max=self._value_clip[agent_0]
                         )
@@ -646,7 +639,7 @@ class MAPPO(MultiAgent):
             f"Loss / Value loss",
             cumulative_value_loss / (self._learning_epochs[agent_0] * self._mini_batches[agent_0]),
         )
-        if self._entropy_loss_scale:
+        if self._entropy_loss_scale[agent_0]:
             self.track_data(
                 f"Loss / Entropy loss",
                 cumulative_entropy_loss / (self._learning_epochs[agent_0] * self._mini_batches[agent_0]),
