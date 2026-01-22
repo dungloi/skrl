@@ -353,6 +353,7 @@ class MAPPO(MultiAgent):
             self._current_shared_next_states = infos["shared_next_states"]
 
             total_reward = torch.stack([rewards[uid] for uid in self.possible_agents], dim=0).sum(dim=0)
+            total_reward /= len(self.possible_agents)
             for uid in self.possible_agents:
                 rewards[uid].copy_(total_reward)
 
@@ -460,12 +461,11 @@ class MAPPO(MultiAgent):
                 advantages[i] = advantage
             # returns computation
             returns = advantages + values
-            # normalize advantages
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
             return returns, advantages
 
         sampled_batches = {}
+        advantages_buffer = {}
         value_list, return_list = [], []
         for uid in self.possible_agents:
             value = self.values[uid]
@@ -496,7 +496,16 @@ class MAPPO(MultiAgent):
 
             memory.set_tensor_by_name("values", self._value_preprocessor[uid](values, train=True))
             memory.set_tensor_by_name("returns", self._value_preprocessor[uid](returns, train=True))
-            memory.set_tensor_by_name("advantages", advantages)
+            advantages_buffer[uid] = advantages
+
+        # normalize advantages across all agents
+        all_advantages = torch.cat([advantages_buffer[uid].reshape(-1) for uid in self.possible_agents])
+        advantages_mean = all_advantages.mean()
+        advantages_std = all_advantages.std(unbiased=False) + 1e-8
+        for uid in self.possible_agents:
+            memory = self.memories[uid]
+            normalized_advantages = (advantages_buffer[uid] - advantages_mean) / advantages_std
+            memory.set_tensor_by_name("advantages", normalized_advantages)
 
             # sample mini-batches from memory
             sampled_batches[uid] = memory.sample_all(names=self._tensors_names, mini_batches=self._mini_batches[uid])
@@ -519,7 +528,9 @@ class MAPPO(MultiAgent):
                 else:
                     for tensor_idx, tensor in enumerate(batch):
                         merged_batches[batch_idx][tensor_idx] = torch.cat((merged_batches[batch_idx][tensor_idx], tensor), dim=0)   # batch dimension: dim=0
-        sampled_batches_all = [tuple(batch) for batch in merged_batches]
+        num_batches = self._mini_batches[agent_0]
+        num_tensors = len(merged_batches[0])
+        batch_size = merged_batches[0][0].shape[0]
 
         policy = self.policies[agent_0]
         value = self.values[agent_0]
@@ -531,7 +542,20 @@ class MAPPO(MultiAgent):
 
         # learning epochs
         for epoch in range(self._learning_epochs[agent_0]):
+            early_stop = False
             kl_divergences = []
+
+            # shuffle samples across all agents to reduce temporal correlations
+            flat_batches = [
+                torch.cat([batch[tensor_idx] for batch in merged_batches], dim=0) for tensor_idx in range(num_tensors)
+            ]
+            perm = torch.randperm(flat_batches[0].shape[0], device=flat_batches[0].device)
+            flat_batches = [tensor[perm] for tensor in flat_batches]
+            sampled_batches_all = []
+            for batch_idx in range(num_batches):
+                start = batch_idx * batch_size
+                end = start + batch_size
+                sampled_batches_all.append(tuple(tensor[start:end] for tensor in flat_batches))
 
             # mini-batches loop
             for (
@@ -561,6 +585,7 @@ class MAPPO(MultiAgent):
 
                     # early stopping with KL divergence
                     if self._kl_threshold[agent_0] and kl_divergence > self._kl_threshold[agent_0]:
+                        early_stop = True
                         break
 
                     # compute entropy loss
@@ -629,6 +654,9 @@ class MAPPO(MultiAgent):
                     cumulative_kl_divergence += kl.item()
                 else:
                     self.schedulers[agent_0].step()
+
+            if early_stop:
+                break
 
         # record data
         self.track_data(
