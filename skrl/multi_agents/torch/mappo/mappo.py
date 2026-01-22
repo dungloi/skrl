@@ -464,7 +464,6 @@ class MAPPO(MultiAgent):
 
             return returns, advantages
 
-        sampled_batches = {}
         advantages_buffer = {}
         value_list, return_list = [], []
         for uid in self.possible_agents:
@@ -507,9 +506,6 @@ class MAPPO(MultiAgent):
             normalized_advantages = (advantages_buffer[uid] - advantages_mean) / advantages_std
             memory.set_tensor_by_name("advantages", normalized_advantages)
 
-            # sample mini-batches from memory
-            sampled_batches[uid] = memory.sample_all(names=self._tensors_names, mini_batches=self._mini_batches[uid])
-
         # compute explained variance
         # adapted from https://github.com/DLR-RM/stable-baselines3
         v_pred = torch.cat(value_list).reshape(-1)
@@ -517,20 +513,20 @@ class MAPPO(MultiAgent):
         var_v = torch.var(v_true, unbiased=False)
         explained_var = float("nan") if var_v == 0 else (1 - torch.var(v_true - v_pred, unbiased=False) / var_v).item()
 
-        # merge mini-batches from all agents by concatenating along batch dimension
-        # adapted from https://github.com/jackzeng-robotics/skrl
         agent_0 = self.possible_agents[0]
-        merged_batches = [[] for _ in range(self._mini_batches[agent_0])]
-        for uid in self.possible_agents:
-            for batch_idx, batch in enumerate(sampled_batches[uid]):
-                if not merged_batches[batch_idx]:  
-                    merged_batches[batch_idx] = list(batch)  # shape of batch: [batch_size, ...]
-                else:
-                    for tensor_idx, tensor in enumerate(batch):
-                        merged_batches[batch_idx][tensor_idx] = torch.cat((merged_batches[batch_idx][tensor_idx], tensor), dim=0)   # batch dimension: dim=0
         num_batches = self._mini_batches[agent_0]
-        num_tensors = len(merged_batches[0])
-        batch_size = merged_batches[0][0].shape[0]
+        num_agents = len(self.possible_agents)
+
+        # tensor views for efficient indexed sampling
+        tensors_view = {
+            uid: {name: self.memories[uid].get_tensor_by_name(name, keepdim=False) for name in self._tensors_names}
+            for uid in self.possible_agents
+        }
+        total_per_agent = tensors_view[agent_0][self._tensors_names[0]].shape[0]
+        per_agent_batch_size = total_per_agent // num_batches
+        total_per_agent_used = per_agent_batch_size * num_batches
+        batch_size = per_agent_batch_size * num_agents
+        total_samples = total_per_agent_used * num_agents
 
         policy = self.policies[agent_0]
         value = self.values[agent_0]
@@ -546,27 +542,37 @@ class MAPPO(MultiAgent):
             kl_divergences = []
 
             # shuffle samples across all agents to reduce temporal correlations
-            flat_batches = [
-                torch.cat([batch[tensor_idx] for batch in merged_batches], dim=0) for tensor_idx in range(num_tensors)
-            ]
-            perm = torch.randperm(flat_batches[0].shape[0], device=flat_batches[0].device)
-            flat_batches = [tensor[perm] for tensor in flat_batches]
-            sampled_batches_all = []
+            perm = torch.randperm(total_samples, device=tensors_view[agent_0][self._tensors_names[0]].device)
+
+            # mini-batches loop
             for batch_idx in range(num_batches):
                 start = batch_idx * batch_size
                 end = start + batch_size
-                sampled_batches_all.append(tuple(tensor[start:end] for tensor in flat_batches))
+                batch_indices = perm[start:end]
+                agent_ids = batch_indices // total_per_agent_used
+                sample_ids = batch_indices % total_per_agent_used
 
-            # mini-batches loop
-            for (
-                sampled_states,
-                sampled_shared_states,
-                sampled_actions,
-                sampled_log_prob,
-                sampled_values,
-                sampled_returns,
-                sampled_advantages,
-            ) in sampled_batches_all:
+                per_agent_indices = [sample_ids[agent_ids == agent_idx] for agent_idx in range(num_agents)]
+
+                sampled_tensors = []
+                for name in self._tensors_names:
+                    chunks = []
+                    for agent_idx, uid in enumerate(self.possible_agents):
+                        idx = per_agent_indices[agent_idx]
+                        if idx.numel() == 0:
+                            continue
+                        chunks.append(tensors_view[uid][name][idx])
+                    sampled_tensors.append(torch.cat(chunks, dim=0))
+
+                (
+                    sampled_states,
+                    sampled_shared_states,
+                    sampled_actions,
+                    sampled_log_prob,
+                    sampled_values,
+                    sampled_returns,
+                    sampled_advantages,
+                ) = sampled_tensors
 
                 with torch.autocast(device_type=self._device_type, enabled=self._mixed_precision):
 
