@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from typing import Any, Literal, Type
 
 import copy
@@ -97,6 +98,10 @@ class Runner:
             multivariate_gaussian_model,
             shared_model,
         )
+        # import custom models
+        from skrl.models.torch.custom_models import (
+            CNNMLPPolicy, CNNMLPValue
+        )
 
         component = {
             # models
@@ -106,6 +111,9 @@ class Runner:
             "deterministicmixin": deterministic_model,
             "multivariategaussianmixin": multivariate_gaussian_model,
             "shared": shared_model,
+            # custom models
+            "cnnmlppolicy": CNNMLPPolicy,
+            "cnnmlpvalue": CNNMLPValue,
             # memories
             "randommemory": RandomMemory,
             # agents
@@ -262,14 +270,18 @@ class Runner:
                             )
                     # print model source
                     if self._verbose:
-                        source = model_class(
-                            observation_space=observation_space,
-                            state_space=state_spaces[agent_id],
-                            action_space=action_spaces[agent_id],
-                            device=device,
-                            **self._process_cfg(models_cfg[role]),
-                            return_source=True,
-                        )
+                        # 判断 model_class 为【自定义模型类】还是【模型实例化函数】
+                        if inspect.isclass(model_class):
+                            source = inspect.getsource(model_class)
+                        elif inspect.isfunction(model_class):
+                            source = model_class(
+                                observation_space=observation_space,
+                                state_space=state_spaces[agent_id],
+                                action_space=action_spaces[agent_id],
+                                device=device,
+                                **self._process_cfg(models_cfg[role]),
+                                return_source=True,
+                            )
                         print("==================================================")
                         print(f"Model (role): {role}")
                         print("==================================================\n")
