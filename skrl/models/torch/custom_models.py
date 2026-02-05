@@ -81,27 +81,29 @@ class CNNMLPPolicy(GaussianMixin, Model):
         action_dim  = action_shape[0]
 
         # 2. 定义 CNN 部分 (用于处理 observation['image'])
-        # 这是一个简单的 4 层 Conv 结构
+        # 这是一个简单的 3 层 Conv 结构
+        # 针对 32(H) x 256(W) 长条形图像的特殊优化结构
         self.cnn = nn.Sequential(
-            # 第一层：快速下采样，处理高分辨率
-            # Kernel=(8,8), Stride=(4,4) -> H/4, W/4
-            # Out: 32 x 23 x 119
-            nn.Conv2d(in_channels, 32, kernel_size=8, stride=4),
+            # 第一层：非对称压缩
+            # Kernel=5 (比8小以适应短边), Stride=(2, 4) (高度/2, 宽度/4)
+            # H: (32-5)/2 + 1 = 14
+            # W: (256-5)/4 + 1 = 63
+            # Out: 32 x 14 x 63
+            nn.Conv2d(in_channels, 32, kernel_size=5, stride=(2, 4)),
             nn.ReLU(),
-            # 第二层：继续下采样
-            # Kernel=(4,4), Stride=(2,2) -> H/2, W/2
-            # Out: 64 x 10 x 58
-            nn.Conv2d(32, 64, kernel_size=4, stride=2),
+            # 第二层：均匀压缩
+            # Kernel=3, Stride=2
+            # H: (14-3)/2 + 1 = 6
+            # W: (63-3)/2 + 1 = 31
+            # Out: 64 x 6 x 31
+            nn.Conv2d(32, 64, kernel_size=3, stride=2),
             nn.ReLU(),
-            # 第三层：针对宽图，我们在宽度方向多压缩一点
-            # Kernel=(3,3), Stride=(2,2) -> H/2, W/2
-            # Out: 64 x 4 x 28
-            nn.Conv2d(64, 64, kernel_size=3, stride=2),
-            nn.ReLU(),
-            # 第四层（新增）：原本这里就Flatten了，现在加一层来整理特征
-            # Kernel=(3,3), Stride=(1,1) -> H-2, W-2 (Valid padding)
-            # Out: 64 x 2 x 26
-            nn.Conv2d(64, 64, kernel_size=3, stride=1),
+            # 第三层：只压缩宽度，保留高度细节
+            # Kernel=3, Stride=(1, 2) (高度不减，宽度/2)
+            # H: (6-3)/1 + 1 = 4
+            # W: (31-3)/2 + 1 = 15
+            # Out: 64 x 4 x 15
+            nn.Conv2d(64, 64, kernel_size=3, stride=(1, 2)),
             nn.ReLU(),
             nn.Flatten(),
         )
@@ -218,27 +220,29 @@ class CNNMLPValue(DeterministicMixin, Model):
         state_dim   = state_shape[0]
 
         # 2. 定义 CNN 部分 (用于处理 observation['image'])
-        # 这是一个简单的 4 层 Conv 结构
+        # 这是一个简单的 3 层 Conv 结构
+        # 针对 32(H) x 256(W) 长条形图像的特殊优化结构
         self.cnn = nn.Sequential(
-            # 第一层：快速下采样，处理高分辨率
-            # Kernel=(8,8), Stride=(4,4) -> H/4, W/4
-            # Out: 32 x 23 x 119
-            nn.Conv2d(in_channels, 32, kernel_size=8, stride=4),
+            # 第一层：非对称压缩
+            # Kernel=5 (比8小以适应短边), Stride=(2, 4) (高度/2, 宽度/4)
+            # H: (32-5)/2 + 1 = 14
+            # W: (256-5)/4 + 1 = 63
+            # Out: 32 x 14 x 63
+            nn.Conv2d(in_channels, 32, kernel_size=5, stride=(2, 4)),
             nn.ReLU(),
-            # 第二层：继续下采样
-            # Kernel=(4,4), Stride=(2,2) -> H/2, W/2
-            # Out: 64 x 10 x 58
-            nn.Conv2d(32, 64, kernel_size=4, stride=2),
+            # 第二层：均匀压缩
+            # Kernel=3, Stride=2
+            # H: (14-3)/2 + 1 = 6
+            # W: (63-3)/2 + 1 = 31
+            # Out: 64 x 6 x 31
+            nn.Conv2d(32, 64, kernel_size=3, stride=2),
             nn.ReLU(),
-            # 第三层：针对宽图，我们在宽度方向多压缩一点
-            # Kernel=(3,3), Stride=(2,2) -> H/2, W/2
-            # Out: 64 x 4 x 28
-            nn.Conv2d(64, 64, kernel_size=3, stride=2),
-            nn.ReLU(),
-            # 第四层（新增）：原本这里就Flatten了，现在加一层来整理特征
-            # Kernel=(3,3), Stride=(1,1) -> H-2, W-2 (Valid padding)
-            # Out: 64 x 2 x 26
-            nn.Conv2d(64, 64, kernel_size=3, stride=1),
+            # 第三层：只压缩宽度，保留高度细节
+            # Kernel=3, Stride=(1, 2) (高度不减，宽度/2)
+            # H: (6-3)/1 + 1 = 4
+            # W: (31-3)/2 + 1 = 15
+            # Out: 64 x 4 x 15
+            nn.Conv2d(64, 64, kernel_size=3, stride=(1, 2)),
             nn.ReLU(),
             nn.Flatten(),
         )
