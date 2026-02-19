@@ -115,6 +115,13 @@ class IsaacLabMultiAgentWrapper(MultiAgentEnvWrapper):
         self._observations = None
         self._info = {}
 
+        # 判断是否需要从 observations 中获取 state
+        if (self._unwrapped.state_space is None) or (self._unwrapped.state_space.shape[0] == 0):
+            self._get_state_from_observations = True
+            self._states = None
+        else:
+            self._get_state_from_observations = False
+
     def step(self, actions: dict[str, torch.Tensor]) -> tuple[
         dict[str, torch.Tensor],
         dict[str, torch.Tensor],
@@ -131,9 +138,20 @@ class IsaacLabMultiAgentWrapper(MultiAgentEnvWrapper):
         actions = {k: unflatten_tensorized_space(self.action_spaces[k], v) for k, v in actions.items()}
         with torch.no_grad():
             observations, rewards, terminated, truncated, self._info = self._env.step(actions)
-        self._observations = {
-            k: flatten_tensorized_space(tensorize_space(self.observation_spaces[k], v)) for k, v in observations.items()
-        }
+        if self._get_state_from_observations:
+            self._observations = {
+                k: flatten_tensorized_space(tensorize_space(self.observation_spaces[k], v["policy"]))
+                for k, v in observations.items()
+            }
+            self._states = {
+                k: flatten_tensorized_space(tensorize_space(self.state_spaces[k], v["critic"]))
+                for k, v in observations.items()
+            }
+        else:
+            self._observations = {
+                k: flatten_tensorized_space(tensorize_space(self.observation_spaces[k], v))
+                for k, v in observations.items()
+            }
         return (
             self._observations,
             {k: v.view(-1, 1) for k, v in rewards.items()},
@@ -149,10 +167,20 @@ class IsaacLabMultiAgentWrapper(MultiAgentEnvWrapper):
         """
         if self._reset_once:
             observations, self._info = self._env.reset(seed=self._seed)
-            self._observations = {
-                k: flatten_tensorized_space(tensorize_space(self.observation_spaces[k], v))
-                for k, v in observations.items()
-            }
+            if self._get_state_from_observations:
+                self._observations = {
+                    k: flatten_tensorized_space(tensorize_space(self.observation_spaces[k], v["policy"]))
+                    for k, v in observations.items()
+                }
+                self._states = {
+                    k: flatten_tensorized_space(tensorize_space(self.state_spaces[k], v["critic"]))
+                    for k, v in observations.items()
+                }
+            else:
+                self._observations = {
+                    k: flatten_tensorized_space(tensorize_space(self.observation_spaces[k], v))
+                    for k, v in observations.items()
+                }
             self._reset_once = False
             self._seed = None
         return self._observations, self._info
@@ -162,13 +190,16 @@ class IsaacLabMultiAgentWrapper(MultiAgentEnvWrapper):
 
         :return: State.
         """
-        try:
-            state = self._env.state()
-        except AttributeError:  # 'OrderEnforcing' object has no attribute 'state'
-            state = self._unwrapped.state()
-        if state is not None:
-            state = flatten_tensorized_space(tensorize_space(next(iter(self.state_spaces.values())), state))
-        return {uid: state for uid in self.possible_agents}
+        if self._get_state_from_observations:
+            return self._states
+        else:
+            try:
+                state = self._env.state()
+            except AttributeError:  # 'OrderEnforcing' object has no attribute 'state'
+                state = self._unwrapped.state()
+            if state is not None:
+                state = flatten_tensorized_space(tensorize_space(next(iter(self.state_spaces.values())), state))
+            return {uid: state for uid in self.possible_agents}
 
     def render(self, *args, **kwargs) -> None:
         """Render the environment."""
@@ -177,3 +208,19 @@ class IsaacLabMultiAgentWrapper(MultiAgentEnvWrapper):
     def close(self) -> None:
         """Close the environment."""
         self._env.close()
+
+    @property
+    def state_spaces(self) -> dict[str, gymnasium.Space | None]:
+        """State spaces."""
+        if self._get_state_from_observations:
+            return {agent: space["critic"] for agent, space in self._unwrapped.observation_spaces.items()}
+        else:
+            return {agent: self._unwrapped.state_space for agent in self.possible_agents}
+
+    @property
+    def observation_spaces(self) -> dict[str, gymnasium.Space]:
+        """Observation spaces."""
+        if self._get_state_from_observations:
+            return {agent: space["policy"] for agent, space in self._unwrapped.observation_spaces.items()}
+        else:
+            return self._unwrapped.observation_spaces
