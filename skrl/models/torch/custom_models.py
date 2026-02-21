@@ -299,8 +299,224 @@ class CNNMLPValue(DeterministicMixin, Model):
         img_features = self.cnn(img)
         # 2. 拼接特征 (Dim 1 是特征维度)
         combined_features = torch.cat([img_features, state], dim=1)
-        # 3. 通过 MLP 计算动作均值
+        # 3. 通过 MLP 计算 value
         output = self.mlp(combined_features)
+        
+        return output, {}
+
+
+
+
+class MLPIppoPolicy(GaussianMixin, Model):
+    def __init__(
+        self,
+        *,
+        observation_space: gymnasium.Space | None = None,
+        state_space: gymnasium.Space | None = None,
+        action_space: gymnasium.Space | None = None,
+        device: str | torch.device | None = None,
+        clip_actions: bool = False,
+        clip_mean_actions: bool = False,
+        clip_log_std: bool = True,
+        min_log_std: float = -20,
+        max_log_std: float = 2,
+        reduction: Literal["mean", "sum", "prod", "none"] = "sum",
+        role: str = "",
+        initial_log_std: float = 0,
+        fixed_log_std: bool = False,
+        **kwargs
+    ):
+        # 调用基类初始化
+        Model.__init__(
+            self,
+            observation_space=observation_space, state_space=state_space,
+            action_space=action_space, device=device,
+        )
+        GaussianMixin.__init__(
+            self,
+            clip_actions=clip_actions, clip_mean_actions=clip_mean_actions, clip_log_std=clip_log_std,
+            min_log_std=min_log_std, max_log_std=max_log_std, reduction=reduction, role=role,
+        )
+
+        # 打印配置信息
+        print("\n")
+        print("============================ MLPIppoPolicy ============================")
+        print("###### [Model Initialization]")
+        print("observation_space:", observation_space)
+        print("state_space:", state_space)
+        print("action_space:", action_space)
+        print("device:", device)
+        print("\n")
+        print("###### [GaussianMixin Initialization]")
+        print("clip_actions:", clip_actions)
+        print("clip_mean_actions:", clip_mean_actions)
+        print("clip_log_std:", clip_log_std)
+        print("min_log_std:", min_log_std)
+        print("max_log_std:", max_log_std)
+        print("reduction:", reduction)
+        print("role:", role)
+        print("\n")
+        print("###### [Others]")
+        print("initial_log_std:", initial_log_std)
+        print("fixed_log_std:", fixed_log_std)
+        print("======================================================================\n")
+
+        # ------------------- 网络结构定义 -------------------
+
+        # 1. 解析输入空间维度
+        # observation_space 是一个 Dict，包含 "image" 和 "state"
+        # image shape 为 (C, H, W)
+        # image_shape  = observation_space["image"].shape
+        # state_shape  = observation_space["state"].shape
+        action_shape = action_space.shape
+        
+        # in_channels = image_shape[0]
+        # state_dim   = state_shape[0]
+        action_dim  = action_shape[0]
+
+        # 2. 定义 MLP 部分 (State特征 -> Action)
+        self.mlp = nn.Sequential(
+            nn.Linear(observation_space.shape[0], 128),
+            nn.LayerNorm(128),
+            nn.ReLU(),
+            nn.Linear(128, 128),
+            nn.LayerNorm(128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.LayerNorm(64),
+            nn.ReLU(),
+            nn.Linear(64, 32),
+            nn.LayerNorm(32),
+            nn.ReLU(),
+            nn.Linear(32, action_dim)  # 输出动作均值
+        )
+
+        # 3. 定义 log_std 参数
+        self.log_std_parameter = nn.Parameter(
+            torch.full(size=action_space.shape, fill_value=float(initial_log_std), dtype=torch.float32),
+            requires_grad=not fixed_log_std
+        )
+
+
+    def compute(self, inputs, role=""):
+
+        # 把扁平的 tensor 还原回字典结构
+        observations = unflatten_tensorized_space(self.observation_space, inputs.get("observations"))
+        # states = unflatten_tensorized_space(self.state_space, inputs.get("states"))
+        # taken_actions = unflatten_tensorized_space(self.action_space, inputs.get("taken_actions"))
+
+        # # 测试用代码段
+        # print("\n")
+        # print("============================ CNNMLPPolicy ============================")
+        # print("observations [image]:", observations["image"].shape)
+        # print("observations [state]:", observations["state"].shape)
+        # print("states [image]:", states["image"].shape)
+        # print("states [state]:", states["state"].shape)
+        # if taken_actions is not None:
+        #     print("taken_actions:", taken_actions.shape)
+        # output = torch.zeros((observations["image"].shape[0], 4), dtype=observations["image"].dtype, device=observations["image"].device)
+
+        # 前向传播
+        # img = observations["image"]
+        # state = observations["state"]
+        
+        # 1. 通过 MLP 计算动作均值
+        output = self.mlp(observations)
         # 这里不需要处理 taken_actions，因为这是 compute forward
+        
+        return output, {"log_std": self.log_std_parameter}
+
+
+
+
+class MLPIppoValue(DeterministicMixin, Model):
+    def __init__(
+        self,
+        *,
+        observation_space: gymnasium.Space | None = None,
+        state_space: gymnasium.Space | None = None,
+        action_space: gymnasium.Space | None = None,
+        device: str | torch.device | None = None,
+        clip_actions: bool = False,
+        role: str = "",
+        **kwargs
+    ):
+        # 调用基类初始化
+        Model.__init__(
+            self,
+            observation_space=observation_space, state_space=state_space,
+            action_space=action_space, device=device,
+        )
+        DeterministicMixin.__init__(self, clip_actions=clip_actions, role=role)
+
+        # 打印配置信息
+        print("\n")
+        print("============================ MLPIppoValue =============================")
+        print("###### [Model Initialization]")
+        print("observation_space:", observation_space)
+        print("state_space:", state_space)
+        print("action_space:", action_space)
+        print("device:", device)
+        print("\n")
+        print("###### [DeterministicMixin Initialization]")
+        print("clip_actions:", clip_actions)
+        print("role:", role)
+        print("======================================================================\n")
+
+        # ------------------- 网络结构定义 -------------------
+
+        # 1. 解析输入空间维度
+        # observation_space 是一个 Dict，包含 "image" 和 "state"
+        # image shape 为 (C, H, W)
+        # image_shape  = observation_space["image"].shape
+        # state_shape  = observation_space["state"].shape
+        action_shape = action_space.shape
+        
+        # in_channels = image_shape[0]
+        # state_dim   = state_shape[0]
+        action_dim  = action_shape[0]
+
+        # 2. 定义 MLP 部分 (State特征 -> Action)
+        self.mlp = nn.Sequential(
+            nn.Linear(state_space.shape[0], 128),
+            nn.LayerNorm(128),
+            nn.ReLU(),
+            nn.Linear(128, 128),
+            nn.LayerNorm(128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.LayerNorm(64),
+            nn.ReLU(),
+            nn.Linear(64, 32),
+            nn.LayerNorm(32),
+            nn.ReLU(),
+            nn.Linear(32, 1)  # 输出 value
+        )
+
+
+    def compute(self, inputs, role=""):
+
+        # 把扁平的 tensor 还原回字典结构
+        # observations = unflatten_tensorized_space(self.observation_space, inputs.get("observations"))
+        states = unflatten_tensorized_space(self.state_space, inputs.get("states"))
+        # taken_actions = unflatten_tensorized_space(self.action_space, inputs.get("taken_actions"))
+
+        # # 测试用代码段
+        # print("\n")
+        # print("============================ CNNMLPValue =============================")
+        # print("observations [image]:", observations["image"].shape)
+        # print("observations [state]:", observations["state"].shape)
+        # print("states [image]:", states["image"].shape)
+        # print("states [state]:", states["state"].shape)
+        # if taken_actions is not None:
+        #     print("taken_actions:", taken_actions.shape)
+        # output = torch.zeros((observations["image"].shape[0], 1), dtype=observations["image"].dtype, device=observations["image"].device)  # 占位符
+
+        # 前向传播
+        # img = states["image"]
+        # state = states["state"]
+
+        # 1. 通过 MLP 计算 value
+        output = self.mlp(states)
         
         return output, {}
