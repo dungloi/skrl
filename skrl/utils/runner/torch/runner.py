@@ -102,6 +102,7 @@ class Runner:
         from skrl.models.torch.custom_models import (
             CNNMLPPolicy, CNNMLPValue,
             MLPIppoPolicy, MLPIppoValue,
+            AttentionMLPPolicy, AttentionMLPValue,
         )
 
         component = {
@@ -117,6 +118,8 @@ class Runner:
             "cnnmlpvalue": CNNMLPValue,
             "mlpippopolicy": MLPIppoPolicy,
             "mlpippovalue": MLPIppoValue,
+            "attentionmlppolicy": AttentionMLPPolicy,
+            "attentionmlpvalue": AttentionMLPValue,
             # memories
             "randommemory": RandomMemory,
             # agents
