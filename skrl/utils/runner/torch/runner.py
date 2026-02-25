@@ -103,6 +103,7 @@ class Runner:
             CNNMLPPolicy, CNNMLPValue,
             MLPIppoPolicy, MLPIppoValue,
             AttentionMLPPolicy, AttentionMLPValue,
+            CNNAttentionMLPPolicy, CNNAttentionMLPValue,
         )
 
         component = {
@@ -120,6 +121,8 @@ class Runner:
             "mlpippovalue": MLPIppoValue,
             "attentionmlppolicy": AttentionMLPPolicy,
             "attentionmlpvalue": AttentionMLPValue,
+            "cnnattentionmlppolicy": CNNAttentionMLPPolicy,
+            "cnnattentionmlpvalue": CNNAttentionMLPValue,
             # memories
             "randommemory": RandomMemory,
             # agents
