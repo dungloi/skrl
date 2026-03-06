@@ -1,6 +1,7 @@
 from typing import Any, Mapping, Type, Union
 
 import copy
+import importlib
 from loguru import logger as logger_
 
 from skrl import logger
@@ -72,6 +73,7 @@ class Runner:
         :return: skrl component
         """
         component = None
+        raw_name = name
         name = name.lower()
         # model
         if name == "gaussianmixin":
@@ -147,8 +149,20 @@ class Runner:
         elif name == "sequentialtrainer":
             from skrl.trainers.torch import SequentialTrainer as component
 
+        if component is None and isinstance(raw_name, str):
+            module_name, attr_name = None, None
+            if ":" in raw_name:
+                module_name, attr_name = raw_name.split(":", 1)
+            elif "." in raw_name:
+                module_name, attr_name = raw_name.rsplit(".", 1)
+            if module_name and attr_name:
+                try:
+                    component = getattr(importlib.import_module(module_name), attr_name)
+                except Exception as e:
+                    raise ValueError(f"Unable to import component '{raw_name}' in runner cfg") from e
+
         if component is None:
-            raise ValueError(f"Unknown component '{name}' in runner cfg")
+            raise ValueError(f"Unknown component '{raw_name}' in runner cfg")
         return component
 
     def _process_cfg(self, cfg: dict) -> dict:
