@@ -57,6 +57,7 @@ class _SwarmAttentionBackbone(nn.Module):
         embed_dim: int,
         num_attention_heads: int,
         attention_dropout: float,
+        attention_chunk_size: int,
         activation: str,
     ) -> None:
         super().__init__()
@@ -71,6 +72,8 @@ class _SwarmAttentionBackbone(nn.Module):
             raise ValueError(f"embed_dim must be positive, got {embed_dim}")
         if embed_dim % num_attention_heads != 0:
             raise ValueError("embed_dim must be divisible by num_attention_heads: " f"{embed_dim} % {num_attention_heads} != 0")
+        if attention_chunk_size <= 0:
+            raise ValueError(f"attention_chunk_size must be positive, got {attention_chunk_size}")
 
         transient_obs_dim = observation_dim // history_length
         relative_total_dim = transient_obs_dim - self_observation_dim
@@ -96,6 +99,8 @@ class _SwarmAttentionBackbone(nn.Module):
         self.transient_observation_dim = transient_obs_dim
         self.num_other_agents = inferred_num_other
         self.embed_dim = embed_dim
+        self.temporal_attention_chunk_size = attention_chunk_size
+        self.neighbor_attention_chunk_size = history_length * attention_chunk_size
 
         self.ego_embedding = nn.Sequential(
             nn.Linear(self_observation_dim, embed_dim),
@@ -131,6 +136,31 @@ class _SwarmAttentionBackbone(nn.Module):
 
         self.output_dim = 2 * embed_dim
 
+    @staticmethod
+    def _run_attention_in_chunks(
+        attention: nn.MultiheadAttention,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        chunk_size: int,
+    ) -> torch.Tensor:
+        batch_tokens = query.shape[0]
+        if batch_tokens <= chunk_size:
+            output, _ = attention(query=query, key=key, value=value, need_weights=False)
+            return output
+
+        outputs: list[torch.Tensor] = []
+        for start in range(0, batch_tokens, chunk_size):
+            end = min(start + chunk_size, batch_tokens)
+            output_chunk, _ = attention(
+                query=query[start:end],
+                key=key[start:end],
+                value=value[start:end],
+                need_weights=False,
+            )
+            outputs.append(output_chunk)
+        return torch.cat(outputs, dim=0)
+
     def forward(self, states: torch.Tensor) -> torch.Tensor:
         if states.dim() != 2:
             raise ValueError(f"states must be rank-2 [batch, dim], got shape={tuple(states.shape)}")
@@ -142,16 +172,26 @@ class _SwarmAttentionBackbone(nn.Module):
         ego_emb = self.ego_embedding(ego)  # [batch_size, history_length, embed_dim]
 
         other_flat = states[:, :, self.self_observation_dim :]  # [batch_size, history_length, num_other_agents * relative_observation_dim]
-        other = other_flat.reshape(batch_size, self.history_length, self.num_other_agents, self.relative_observation_dim)  # [batch_size, history_length, num_other_agents, relative_observation_dim]
+        other = other_flat.reshape(
+            batch_size,
+            self.history_length,
+            self.num_other_agents,
+            self.relative_observation_dim,
+        )  # [batch_size, history_length, num_other_agents, relative_observation_dim]
         other_emb = self.other_embedding(other)  # [batch_size, history_length, num_other_agents, embed_dim]
 
         query = ego_emb.reshape(batch_size * self.history_length, 1, self.embed_dim)  # [batch_size * history_length, 1, embed_dim]
-        key_value = other_emb.reshape(batch_size * self.history_length, self.num_other_agents, self.embed_dim)  # [batch_size * history_length, num_other_agents, embed_dim]
-        attention_output, _ = self.neighbor_attention(
+        key_value = other_emb.reshape(
+            batch_size * self.history_length,
+            self.num_other_agents,
+            self.embed_dim,
+        )  # [batch_size * history_length, num_other_agents, embed_dim]
+        attention_output = self._run_attention_in_chunks(
+            self.neighbor_attention,
             query=query,
             key=key_value,
             value=key_value,
-            need_weights=False,
+            chunk_size=self.neighbor_attention_chunk_size,
         )
         neighbor_context = attention_output.squeeze(1)  # [batch_size * history_length, embed_dim]
         fused = torch.cat([ego_emb.reshape(batch_size * self.history_length, self.embed_dim), neighbor_context], dim=-1)  # [batch_size * history_length, 2 * embed_dim]
@@ -159,11 +199,12 @@ class _SwarmAttentionBackbone(nn.Module):
         step_tokens = self.step_fusion(fused).reshape(batch_size, self.history_length, self.embed_dim)  # [batch_size, history_length, embed_dim]
         step_tokens = step_tokens + self.temporal_pos_embedding  # [batch_size, history_length, embed_dim]
 
-        temporal_output, _ = self.temporal_attention(
+        temporal_output = self._run_attention_in_chunks(
+            self.temporal_attention,
             query=step_tokens,
             key=step_tokens,
             value=step_tokens,
-            need_weights=False,
+            chunk_size=self.temporal_attention_chunk_size,
         )
         step_tokens = self.temporal_norm(step_tokens + temporal_output)  # [batch_size, history_length, embed_dim]
 
@@ -192,6 +233,7 @@ class _SwarmAttentionGaussianModel(GaussianMixin, Model):
         embed_dim: int = 64,
         num_attention_heads: int = 4,
         attention_dropout: float = 0.0,
+        attention_chunk_size: int = 8192,
         mlp_hidden_layers: Sequence[int] = (128, 64, 32),
         activation: str = "elu",
         role: str = "",
@@ -221,6 +263,7 @@ class _SwarmAttentionGaussianModel(GaussianMixin, Model):
             embed_dim=embed_dim,
             num_attention_heads=num_attention_heads,
             attention_dropout=attention_dropout,
+            attention_chunk_size=attention_chunk_size,
             activation=activation,
         )
         self.action_head = _build_layernorm_mlp(
@@ -254,6 +297,7 @@ class _SwarmAttentionDeterministicModel(DeterministicMixin, Model):
         embed_dim: int = 64,
         num_attention_heads: int = 4,
         attention_dropout: float = 0.0,
+        attention_chunk_size: int = 8192,
         mlp_hidden_layers: Sequence[int] = (128, 64, 32),
         activation: str = "elu",
         role: str = "",
@@ -275,6 +319,7 @@ class _SwarmAttentionDeterministicModel(DeterministicMixin, Model):
             embed_dim=embed_dim,
             num_attention_heads=num_attention_heads,
             attention_dropout=attention_dropout,
+            attention_chunk_size=attention_chunk_size,
             activation=activation,
         )
         self.value_head = _build_layernorm_mlp(
