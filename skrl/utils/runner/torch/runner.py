@@ -1,6 +1,7 @@
 from typing import Any, Mapping, Type, Union
 
 import copy
+from loguru import logger as logger_
 
 from skrl import logger
 from skrl.agents.torch import Agent
@@ -208,6 +209,13 @@ class Runner:
 
         agent_class = cfg.get("agent", {}).get("class", "").lower()
 
+        # TODO: Non-parameter-sharing configurations are not supported for now
+        param_sharing = cfg.get("agent", {}).get("param_sharing", True)
+        if not param_sharing:
+            logger_.warning("Non-parameter-sharing configurations are not supported for now. Forcing 'param_sharing' = True")
+            param_sharing = True
+        agent_0 = possible_agents[0]
+
         # instantiate models
         models = {}
         for agent_id in possible_agents:
@@ -226,6 +234,10 @@ class Runner:
             # non-shared models
             if separate:
                 for role in models_cfg:
+                    if param_sharing and agent_id != agent_0:
+                        models[agent_id][role] = models[agent_0][role]
+                        continue
+
                     # get instantiator function and remove 'class' key
                     model_class = models_cfg[role].get("class")
                     if not model_class:
@@ -265,6 +277,11 @@ class Runner:
                     )
             # shared models
             else:
+                if param_sharing and agent_id != agent_0:
+                    models[agent_id][role[0]] = models[agent_0][role[0]]
+                    models[agent_id][role[1]] = models[agent_0][role[1]]
+                    continue
+                
                 roles = list(models_cfg.keys())
                 if len(roles) != 2:
                     raise ValueError(

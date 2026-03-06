@@ -18,7 +18,7 @@ from skrl.resources.schedulers.torch import KLAdaptiveLR
 
 # fmt: off
 # [start-config-dict-torch]
-IPPO_DEFAULT_CONFIG = {
+MAPPO_DEFAULT_CONFIG = {
     "rollouts": 16,                 # number of rollouts before updating
     "learning_epochs": 8,           # number of learning epochs during each update
     "mini_batches": 2,              # number of mini batches during each learning epoch
@@ -32,6 +32,8 @@ IPPO_DEFAULT_CONFIG = {
 
     "state_preprocessor": None,             # state preprocessor class (see skrl.resources.preprocessors)
     "state_preprocessor_kwargs": {},        # state preprocessor's kwargs (e.g. {"size": env.observation_space})
+    "shared_state_preprocessor": None,      # shared state preprocessor class (see skrl.resources.preprocessors)
+    "shared_state_preprocessor_kwargs": {}, # shared state preprocessor's kwargs (e.g. {"size": env.shared_observation_space})
     "value_preprocessor": None,             # value preprocessor class (see skrl.resources.preprocessors)
     "value_preprocessor_kwargs": {},        # value preprocessor's kwargs (e.g. {"size": 1})
 
@@ -69,7 +71,7 @@ IPPO_DEFAULT_CONFIG = {
 # fmt: on
 
 
-class IPPO(MultiAgent):
+class MAPPO_RNN(MultiAgent):
     def __init__(
         self,
         possible_agents: Sequence[str],
@@ -79,10 +81,11 @@ class IPPO(MultiAgent):
         action_spaces: Optional[Union[Mapping[str, int], Mapping[str, gymnasium.Space]]] = None,
         device: Optional[Union[str, torch.device]] = None,
         cfg: Optional[dict] = None,
+        shared_observation_spaces: Optional[Union[Mapping[str, int], Mapping[str, gymnasium.Space]]] = None,
     ) -> None:
-        """Independent Proximal Policy Optimization (IPPO)
+        """Multi-Agent Proximal Policy Optimization (MAPPO) with support for Recurrent Neural Networks (RNN, GRU, LSTM, etc.)
 
-        https://arxiv.org/abs/2011.09533
+        https://arxiv.org/abs/2103.01955
 
         :param possible_agents: Name of all possible agents the environment could generate
         :type possible_agents: list of str
@@ -100,8 +103,10 @@ class IPPO(MultiAgent):
         :type device: str or torch.device, optional
         :param cfg: Configuration dictionary
         :type cfg: dict
+        :param shared_observation_spaces: Shared observation/state space or shape (default: ``None``)
+        :type shared_observation_spaces: dictionary of int, sequence of int or gymnasium.Space, optional
         """
-        _cfg = copy.deepcopy(IPPO_DEFAULT_CONFIG)
+        _cfg = copy.deepcopy(MAPPO_DEFAULT_CONFIG)
         _cfg.update(cfg if cfg is not None else {})
         super().__init__(
             possible_agents=possible_agents,
@@ -112,6 +117,8 @@ class IPPO(MultiAgent):
             device=device,
             cfg=_cfg,
         )
+
+        self.shared_observation_spaces = shared_observation_spaces
 
         # models
         self.policies = {uid: self.models[uid].get("policy", None) for uid in self.possible_agents}
@@ -156,6 +163,8 @@ class IPPO(MultiAgent):
 
         self._state_preprocessor = self._as_dict(self.cfg["state_preprocessor"])
         self._state_preprocessor_kwargs = self._as_dict(self.cfg["state_preprocessor_kwargs"])
+        self._shared_state_preprocessor = self._as_dict(self.cfg["shared_state_preprocessor"])
+        self._shared_state_preprocessor_kwargs = self._as_dict(self.cfg["shared_state_preprocessor_kwargs"])
         self._value_preprocessor = self._as_dict(self.cfg["value_preprocessor"])
         self._value_preprocessor_kwargs = self._as_dict(self.cfg["value_preprocessor_kwargs"])
 
@@ -194,6 +203,10 @@ class IPPO(MultiAgent):
                 if "state_preprocessor" in self.checkpoint_modules[agent_0]:
                     self.checkpoint_modules[uid]["state_preprocessor"] = self.checkpoint_modules[agent_0]["state_preprocessor"]
 
+                self._shared_state_preprocessor[uid] = self._shared_state_preprocessor[agent_0]
+                if "shared_state_preprocessor" in self.checkpoint_modules[agent_0]:
+                    self.checkpoint_modules[uid]["shared_state_preprocessor"] = self.checkpoint_modules[agent_0]["shared_state_preprocessor"]
+
                 self._value_preprocessor[uid] = self._value_preprocessor[agent_0]
                 if "value_preprocessor" in self.checkpoint_modules[agent_0]:
                     self.checkpoint_modules[uid]["value_preprocessor"] = self.checkpoint_modules[agent_0]["value_preprocessor"]
@@ -224,6 +237,14 @@ class IPPO(MultiAgent):
             else:
                 self._state_preprocessor[uid] = self._empty_preprocessor
 
+            if self._shared_state_preprocessor[uid] is not None:
+                self._shared_state_preprocessor[uid] = self._shared_state_preprocessor[uid](
+                    **self._shared_state_preprocessor_kwargs[uid]
+                )
+                self.checkpoint_modules[uid]["shared_state_preprocessor"] = self._shared_state_preprocessor[uid]
+            else:
+                self._shared_state_preprocessor[uid] = self._empty_preprocessor
+
             if self._value_preprocessor[uid] is not None:
                 self._value_preprocessor[uid] = self._value_preprocessor[uid](**self._value_preprocessor_kwargs[uid])
                 self.checkpoint_modules[uid]["value_preprocessor"] = self._value_preprocessor[uid]
@@ -239,6 +260,9 @@ class IPPO(MultiAgent):
         if self.memories:
             for uid in self.possible_agents:
                 self.memories[uid].create_tensor(name="states", size=self.observation_spaces[uid], dtype=torch.float32)
+                self.memories[uid].create_tensor(
+                    name="shared_states", size=self.shared_observation_spaces[uid], dtype=torch.float32
+                )
                 self.memories[uid].create_tensor(name="actions", size=self.action_spaces[uid], dtype=torch.float32)
                 self.memories[uid].create_tensor(name="rewards", size=1, dtype=torch.float32)
                 self.memories[uid].create_tensor(name="terminated", size=1, dtype=torch.bool)
@@ -248,12 +272,50 @@ class IPPO(MultiAgent):
                 self.memories[uid].create_tensor(name="returns", size=1, dtype=torch.float32)
                 self.memories[uid].create_tensor(name="advantages", size=1, dtype=torch.float32)
 
-                # tensors sampled during training
-                self._tensors_names = ["states", "actions", "log_prob", "values", "returns", "advantages"]
+            # tensors sampled during training (include terminated/truncated for RNN masking)
+            self._tensors_names = ["states", "shared_states", "actions", "terminated", "truncated", "log_prob", "values", "returns", "advantages"]
+
+        # RNN specifications
+        self._rnn = {uid: False for uid in self.possible_agents}
+        self._rnn_tensors_names = {uid: [] for uid in self.possible_agents}
+        self._rnn_initial_states = {uid: {"policy": [], "value": []} for uid in self.possible_agents}
+        self._rnn_final_states = {uid: {"policy": [], "value": []} for uid in self.possible_agents}
+        self._rnn_sequence_length = {
+            uid: self.policies[uid].get_specification().get("rnn", {}).get("sequence_length", 1)
+            for uid in self.possible_agents
+        }
+
+        if self.memories:
+            for uid in self.possible_agents:
+                # policy RNN states (per layer)
+                for i, size in enumerate(self.policies[uid].get_specification().get("rnn", {}).get("sizes", [])):
+                    self._rnn[uid] = True
+                    self.memories[uid].create_tensor(
+                        name=f"rnn_policy_{i}", size=(size[0], size[2]), dtype=torch.float32, keep_dimensions=True
+                    )
+                    self._rnn_tensors_names[uid].append(f"rnn_policy_{i}")
+                    self._rnn_initial_states[uid]["policy"].append(
+                        torch.zeros(size, dtype=torch.float32, device=self.device)
+                    )
+
+                # value RNN states (per layer)
+                if self.values[uid] is not None:
+                    if self.policies[uid] is self.values[uid]:
+                        self._rnn_initial_states[uid]["value"] = self._rnn_initial_states[uid]["policy"]
+                    else:
+                        for i, size in enumerate(self.values[uid].get_specification().get("rnn", {}).get("sizes", [])):
+                            self._rnn[uid] = True
+                            self.memories[uid].create_tensor(
+                                name=f"rnn_value_{i}", size=(size[0], size[2]), dtype=torch.float32, keep_dimensions=True
+                            )
+                            self._rnn_tensors_names[uid].append(f"rnn_value_{i}")
+                            self._rnn_initial_states[uid]["value"].append(
+                                torch.zeros(size, dtype=torch.float32, device=self.device)
+                            )
 
         # create temporary variables needed for storage and computation
         self._current_log_prob = []
-        self._current_next_states = []
+        self._current_shared_next_states = []
 
     def act(self, states: Mapping[str, torch.Tensor], timestep: int, timesteps: int) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], Dict[str, Any]]:
         """Process the environment's states to make a decision (actions) using the main policies
@@ -274,16 +336,24 @@ class IPPO(MultiAgent):
 
         # sample stochastic actions
         with torch.autocast(device_type=self._device_type, enabled=self._mixed_precision):
-            data = [
-                self.policies[uid].act({"states": self._state_preprocessor[uid](states[uid])}, role="policy")
-                for uid in self.possible_agents
-            ]
+            data = []
+            for uid in self.possible_agents:
+                rnn_kwargs = {"rnn": self._rnn_initial_states[uid]["policy"]} if self._rnn[uid] else {}
+                d = self.policies[uid].act(
+                    {"states": self._state_preprocessor[uid](states[uid]), **rnn_kwargs}, role="policy"
+                )
+                data.append(d)
 
             actions = {uid: d[0] for uid, d in zip(self.possible_agents, data)}
             log_prob = {uid: d[1] for uid, d in zip(self.possible_agents, data)}
             outputs = {uid: d[2] for uid, d in zip(self.possible_agents, data)}
 
             self._current_log_prob = log_prob
+
+        # keep latest policy RNN states
+        for uid in self.possible_agents:
+            if self._rnn[uid]:
+                self._rnn_final_states[uid]["policy"] = outputs[uid].get("rnn", [])
 
         return actions, log_prob, outputs
 
@@ -325,7 +395,12 @@ class IPPO(MultiAgent):
         )
 
         if self.memories:
-            self._current_next_states = next_states
+            shared_states = infos["shared_states"]
+            self._current_shared_next_states = infos["shared_next_states"]
+
+            total_reward = torch.stack([rewards[uid] for uid in self.possible_agents], dim=0).sum(dim=0)
+            for uid in self.possible_agents:
+                rewards[uid].copy_(total_reward)
 
             for uid in self.possible_agents:
                 # reward shaping
@@ -334,14 +409,26 @@ class IPPO(MultiAgent):
 
                 # compute values
                 with torch.autocast(device_type=self._device_type, enabled=self._mixed_precision):
-                    values, _, _ = self.values[uid].act(
-                        {"states": self._state_preprocessor[uid](states[uid])}, role="value"
+                    rnn_kwargs = {"rnn": self._rnn_initial_states[uid]["value"]} if self._rnn[uid] else {}
+                    values, _, outputs = self.values[uid].act(
+                        {"states": self._shared_state_preprocessor[uid](shared_states), **rnn_kwargs}, role="value"
                     )
                     values = self._value_preprocessor[uid](values, inverse=True)
 
                 # time-limit (truncation) bootstrapping
                 if self._time_limit_bootstrap[uid]:
                     rewards[uid] += self._discount_factor[uid] * values * truncated[uid]
+
+                # package RNN states to memory
+                rnn_states = {}
+                if self._rnn[uid]:
+                    rnn_states.update(
+                        {f"rnn_policy_{i}": s.transpose(0, 1) for i, s in enumerate(self._rnn_initial_states[uid]["policy"])}
+                    )
+                    if self.policies[uid] is not self.values[uid]:
+                        rnn_states.update(
+                            {f"rnn_value_{i}": s.transpose(0, 1) for i, s in enumerate(self._rnn_initial_states[uid]["value"])}
+                        )
 
                 # storage transition in memory
                 self.memories[uid].add_samples(
@@ -353,7 +440,23 @@ class IPPO(MultiAgent):
                     truncated=truncated[uid],
                     log_prob=self._current_log_prob[uid],
                     values=values,
+                    shared_states=shared_states,
+                    **rnn_states,
                 )
+
+                # update RNN states (zero out finished envs)
+                if self._rnn[uid]:
+                    self._rnn_final_states[uid]["value"] = (
+                        self._rnn_final_states[uid]["policy"] if self.policies[uid] is self.values[uid] else outputs.get("rnn", [])
+                    )
+                    finished = (terminated[uid] | truncated[uid]).nonzero(as_tuple=False)
+                    if finished.numel():
+                        for rnn_state in self._rnn_final_states[uid]["policy"]:
+                            rnn_state[:, finished[:, 0]] = 0
+                        if self.policies[uid] is not self.values[uid]:
+                            for rnn_state in self._rnn_final_states[uid]["value"]:
+                                rnn_state[:, finished[:, 0]] = 0
+                    self._rnn_initial_states[uid] = self._rnn_final_states[uid]
 
     def pre_interaction(self, timestep: int, timesteps: int) -> None:
         """Callback called before the interaction with the environment
@@ -430,10 +533,12 @@ class IPPO(MultiAgent):
                 advantages[i] = advantage
             # returns computation
             returns = advantages + values
+            # normalize advantages
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
             return returns, advantages
 
-        advantages_buffer = {}
+        sampled_batches, sampled_rnn_batches = {}, {}
         value_list, return_list = [], []
         for uid in self.possible_agents:
             value = self.values[uid]
@@ -442,8 +547,10 @@ class IPPO(MultiAgent):
             # compute returns and advantages
             with torch.no_grad(), torch.autocast(device_type=self._device_type, enabled=self._mixed_precision):
                 value.train(False)
+                rnn_kwargs = {"rnn": self._rnn_initial_states[uid]["value"]} if self._rnn[uid] else {}
                 last_values, _, _ = value.act(
-                    {"states": self._state_preprocessor[uid](self._current_next_states[uid].float())}, role="value"
+                    {"states": self._shared_state_preprocessor[uid](self._current_shared_next_states.float()), **rnn_kwargs},
+                    role="value",
                 )
                 value.train(True)
             last_values = self._value_preprocessor[uid](last_values, inverse=True)
@@ -463,16 +570,21 @@ class IPPO(MultiAgent):
 
             memory.set_tensor_by_name("values", self._value_preprocessor[uid](values, train=True))
             memory.set_tensor_by_name("returns", self._value_preprocessor[uid](returns, train=True))
-            advantages_buffer[uid] = advantages
+            memory.set_tensor_by_name("advantages", advantages)
 
-        # normalize advantages across all agents
-        all_advantages = torch.cat([advantages_buffer[uid].reshape(-1) for uid in self.possible_agents])
-        advantages_mean = all_advantages.mean()
-        advantages_std = all_advantages.std(unbiased=False) + 1e-8
-        for uid in self.possible_agents:
-            memory = self.memories[uid]
-            normalized_advantages = (advantages_buffer[uid] - advantages_mean) / advantages_std
-            memory.set_tensor_by_name("advantages", normalized_advantages)
+            # sample mini-batches (sequence mode for RNN)
+            sampled_batches[uid] = memory.sample_all(
+                names=self._tensors_names,
+                mini_batches=self._mini_batches[uid],
+                sequence_length=self._rnn_sequence_length[uid],
+            )
+
+            if self._rnn[uid]:
+                sampled_rnn_batches[uid] = memory.sample_all(
+                    names=self._rnn_tensors_names[uid],
+                    mini_batches=self._mini_batches[uid],
+                    sequence_length=self._rnn_sequence_length[uid],
+                )
 
         # compute explained variance
         # adapted from https://github.com/DLR-RM/stable-baselines3
@@ -481,20 +593,57 @@ class IPPO(MultiAgent):
         var_v = torch.var(v_true, unbiased=False)
         explained_var = float("nan") if var_v == 0 else (1 - torch.var(v_true - v_pred, unbiased=False) / var_v).item()
 
+        # merge mini-batches from all agents by concatenating along batch dimension
+        # adapted from https://github.com/jackzeng-robotics/skrl
         agent_0 = self.possible_agents[0]
         num_batches = self._mini_batches[agent_0]
-        num_agents = len(self.possible_agents)
 
-        # tensor views for efficient indexed sampling
-        tensors_view = {
-            uid: {name: self.memories[uid].get_tensor_by_name(name, keepdim=False) for name in self._tensors_names}
-            for uid in self.possible_agents
-        }
-        total_per_agent = tensors_view[agent_0][self._tensors_names[0]].shape[0]
-        per_agent_batch_size = total_per_agent // num_batches
-        total_per_agent_used = per_agent_batch_size * num_batches
-        batch_size = per_agent_batch_size * num_agents
-        total_samples = total_per_agent_used * num_agents
+        # merge primary tensors
+        merged_batches = [[] for _ in range(num_batches)]
+        for uid in self.possible_agents:
+            for batch_idx, batch in enumerate(sampled_batches[uid]):
+                if not merged_batches[batch_idx]:
+                    merged_batches[batch_idx] = list(batch)  # shape of batch: [sequence_length, batch_size, ...]
+                else:
+                    for tensor_idx, tensor in enumerate(batch):
+                        merged_batches[batch_idx][tensor_idx] = torch.cat((merged_batches[batch_idx][tensor_idx], tensor), dim=1)   # batch dimension: dim=1
+        sampled_batches_all = [tuple(batch) for batch in merged_batches]
+
+        # merge RNN tensors per role (policy/value) and per layer
+        # TODO: not robust 并非鲁棒 :(
+        merged_rnn_policy_batches = None
+        merged_rnn_value_batches = None
+        if self._rnn[agent_0]:
+            # layer counts from agent_0 names
+            num_policy_layers = len([n for n in self._rnn_tensors_names[agent_0] if "policy" in n])
+            num_value_layers = len([n for n in self._rnn_tensors_names[agent_0] if "value" in n]) if (self.policies[agent_0] is not self.values[agent_0]) else 0
+
+            merged_rnn_policy_batches = [[] for _ in range(num_batches)]
+            merged_rnn_value_batches = [[] for _ in range(num_batches)] if num_value_layers > 0 else None
+
+            for b_idx in range(num_batches):
+                policy_layer_collect = [[] for _ in range(num_policy_layers)]
+                value_layer_collect = [[] for _ in range(num_value_layers)] if num_value_layers > 0 else None
+
+                for uid in self.possible_agents:
+                    agent_layers = list(sampled_rnn_batches[uid][b_idx])  # shape of batch: [sequence_length, batch_size, num_layers * num_directions, hidden_size]
+                    agent_names = self._rnn_tensors_names[uid]
+
+                    agent_policy_layers = [s for s, n in zip(agent_layers, agent_names) if "policy" in n]
+                    for i, s in enumerate(agent_policy_layers):
+                        policy_layer_collect[i].append(s)
+
+                    if num_value_layers > 0:
+                        agent_value_layers = [s for s, n in zip(agent_layers, agent_names) if "value" in n]
+                        for i, s in enumerate(agent_value_layers):
+                            value_layer_collect[i].append(s)
+
+                merged_policy_layers = [torch.cat(lst, dim=1) if len(lst) > 1 else lst[0] for lst in policy_layer_collect]   # batch dimension: dim=1
+                merged_rnn_policy_batches[b_idx] = merged_policy_layers
+
+                if num_value_layers > 0:
+                    merged_value_layers = [torch.cat(lst, dim=1) if len(lst) > 1 else lst[0] for lst in value_layer_collect]   # batch dimension: dim=1
+                    merged_rnn_value_batches[b_idx] = merged_value_layers
 
         policy = self.policies[agent_0]
         value = self.values[agent_0]
@@ -506,47 +655,47 @@ class IPPO(MultiAgent):
 
         # learning epochs
         for epoch in range(self._learning_epochs[agent_0]):
-            early_stop = False
             kl_divergences = []
 
-            # shuffle samples across all agents to reduce temporal correlations
-            perm = torch.randperm(total_samples, device=tensors_view[agent_0][self._tensors_names[0]].device)
-
             # mini-batches loop
-            for batch_idx in range(num_batches):
-                start = batch_idx * batch_size
-                end = start + batch_size
-                batch_indices = perm[start:end]
-                agent_ids = batch_indices // total_per_agent_used
-                sample_ids = batch_indices % total_per_agent_used
+            for i, (
+                sampled_states,
+                sampled_shared_states,
+                sampled_actions,
+                sampled_terminated,
+                sampled_truncated,
+                sampled_log_prob,
+                sampled_values,
+                sampled_returns,
+                sampled_advantages,
+            ) in enumerate(sampled_batches_all):
 
-                per_agent_indices = [sample_ids[agent_ids == agent_idx] for agent_idx in range(num_agents)]
-
-                sampled_tensors = []
-                for name in self._tensors_names:
-                    chunks = []
-                    for agent_idx, uid in enumerate(self.possible_agents):
-                        idx = per_agent_indices[agent_idx]
-                        if idx.numel() == 0:
-                            continue
-                        chunks.append(tensors_view[uid][name][idx])
-                    sampled_tensors.append(torch.cat(chunks, dim=0))
-
-                (
-                    sampled_states,
-                    sampled_actions,
-                    sampled_log_prob,
-                    sampled_values,
-                    sampled_returns,
-                    sampled_advantages,
-                ) = sampled_tensors
+                # prepare RNN kwargs
+                rnn_policy_kwargs, rnn_value_kwargs = {}, {}
+                if self._rnn[agent_0]:
+                    if policy is value:
+                        rnn_policy_kwargs = {
+                            "rnn": [s.transpose(0, 1) for s in merged_rnn_policy_batches[i]],
+                            "terminated": sampled_terminated | sampled_truncated,
+                        }
+                        rnn_value_kwargs = rnn_policy_kwargs
+                    else:
+                        rnn_policy_kwargs = {
+                            "rnn": [s.transpose(0, 1) for s in merged_rnn_policy_batches[i]],
+                            "terminated": sampled_terminated | sampled_truncated,
+                        }
+                        rnn_value_kwargs = {
+                            "rnn": [s.transpose(0, 1) for s in merged_rnn_value_batches[i]],
+                            "terminated": sampled_terminated | sampled_truncated,
+                        }
 
                 with torch.autocast(device_type=self._device_type, enabled=self._mixed_precision):
 
                     sampled_states = self._state_preprocessor[agent_0](sampled_states, train=not epoch)
+                    sampled_shared_states = self._shared_state_preprocessor[agent_0](sampled_shared_states, train=not epoch)
 
                     _, next_log_prob, _ = policy.act(
-                        {"states": sampled_states, "taken_actions": sampled_actions}, role="policy"
+                        {"states": sampled_states, "taken_actions": sampled_actions, **rnn_policy_kwargs}, role="policy"
                     )
 
                     # compute approximate KL divergence
@@ -557,7 +706,6 @@ class IPPO(MultiAgent):
 
                     # early stopping with KL divergence
                     if self._kl_threshold[agent_0] and kl_divergence > self._kl_threshold[agent_0]:
-                        early_stop = True
                         break
 
                     # compute entropy loss
@@ -579,7 +727,7 @@ class IPPO(MultiAgent):
                     clip_fractions.append(batch_clip_fraction.detach())
 
                     # compute value loss
-                    predicted_values, _, _ = value.act({"states": sampled_states}, role="value")
+                    predicted_values, _, _ = value.act({"states": sampled_shared_states, **rnn_value_kwargs}, role="value")
 
                     if self._clip_predicted_values[agent_0]:
                         predicted_values = sampled_values + torch.clip(
@@ -626,9 +774,6 @@ class IPPO(MultiAgent):
                     cumulative_kl_divergence += kl.item()
                 else:
                     self.schedulers[agent_0].step()
-
-            if early_stop:
-                break
 
         # record data
         self.track_data(
