@@ -99,16 +99,17 @@ class _SwarmAttentionBackbone(nn.Module):
         self.transient_observation_dim = transient_obs_dim
         self.num_other_agents = inferred_num_other
         self.embed_dim = embed_dim
-        self.temporal_attention_chunk_size = attention_chunk_size
-        self.neighbor_attention_chunk_size = history_length * attention_chunk_size
+        self.neighbor_attention_chunk_size = attention_chunk_size
+        self.ego_stack_dim = history_length * self_observation_dim
+        self.other_stack_dim = history_length * relative_observation_dim
 
         self.ego_embedding = nn.Sequential(
-            nn.Linear(self_observation_dim, embed_dim),
+            nn.Linear(self.ego_stack_dim, embed_dim),
             nn.LayerNorm(embed_dim),
             _build_activation(activation),
         )
         self.other_embedding = nn.Sequential(
-            nn.Linear(relative_observation_dim, embed_dim),
+            nn.Linear(self.other_stack_dim, embed_dim),
             nn.LayerNorm(embed_dim),
             _build_activation(activation),
         )
@@ -119,20 +120,6 @@ class _SwarmAttentionBackbone(nn.Module):
             dropout=attention_dropout,
             batch_first=True,
         )
-
-        self.step_fusion = nn.Sequential(
-            nn.Linear(2 * embed_dim, embed_dim),
-            nn.LayerNorm(embed_dim),
-            _build_activation(activation),
-        )
-        self.temporal_attention = nn.MultiheadAttention(
-            embed_dim=embed_dim,
-            num_heads=num_attention_heads,
-            dropout=attention_dropout,
-            batch_first=True,
-        )
-        self.temporal_pos_embedding = nn.Parameter(torch.zeros(1, history_length, embed_dim, dtype=torch.float32))
-        self.temporal_norm = nn.LayerNorm(embed_dim)
 
         self.output_dim = 2 * embed_dim
 
@@ -169,7 +156,8 @@ class _SwarmAttentionBackbone(nn.Module):
         states = states.reshape(batch_size, self.history_length, self.transient_observation_dim)  # [batch_size, history_length, transient_observation_dim]
 
         ego = states[:, :, : self.self_observation_dim]  # [batch_size, history_length, self_observation_dim]
-        ego_emb = self.ego_embedding(ego)  # [batch_size, history_length, embed_dim]
+        ego_stacked = ego.reshape(batch_size, self.ego_stack_dim)  # [batch_size, history_length * self_observation_dim]
+        ego_emb = self.ego_embedding(ego_stacked)  # [batch_size, embed_dim]
 
         other_flat = states[:, :, self.self_observation_dim :]  # [batch_size, history_length, num_other_agents * relative_observation_dim]
         other = other_flat.reshape(
@@ -178,14 +166,15 @@ class _SwarmAttentionBackbone(nn.Module):
             self.num_other_agents,
             self.relative_observation_dim,
         )  # [batch_size, history_length, num_other_agents, relative_observation_dim]
-        other_emb = self.other_embedding(other)  # [batch_size, history_length, num_other_agents, embed_dim]
-
-        query = ego_emb.reshape(batch_size * self.history_length, 1, self.embed_dim)  # [batch_size * history_length, 1, embed_dim]
-        key_value = other_emb.reshape(
-            batch_size * self.history_length,
+        other_stacked = other.permute(0, 2, 1, 3).reshape(
+            batch_size,
             self.num_other_agents,
-            self.embed_dim,
-        )  # [batch_size * history_length, num_other_agents, embed_dim]
+            self.other_stack_dim,
+        )  # [batch_size, num_other_agents, history_length * relative_observation_dim]
+        other_emb = self.other_embedding(other_stacked)  # [batch_size, num_other_agents, embed_dim]
+
+        query = ego_emb.unsqueeze(1)  # [batch_size, 1, embed_dim]
+        key_value = other_emb  # [batch_size, num_other_agents, embed_dim]
         attention_output = self._run_attention_in_chunks(
             self.neighbor_attention,
             query=query,
@@ -193,24 +182,8 @@ class _SwarmAttentionBackbone(nn.Module):
             value=key_value,
             chunk_size=self.neighbor_attention_chunk_size,
         )
-        neighbor_context = attention_output.squeeze(1)  # [batch_size * history_length, embed_dim]
-        fused = torch.cat([ego_emb.reshape(batch_size * self.history_length, self.embed_dim), neighbor_context], dim=-1)  # [batch_size * history_length, 2 * embed_dim]
-
-        step_tokens = self.step_fusion(fused).reshape(batch_size, self.history_length, self.embed_dim)  # [batch_size, history_length, embed_dim]
-        step_tokens = step_tokens + self.temporal_pos_embedding  # [batch_size, history_length, embed_dim]
-
-        temporal_output = self._run_attention_in_chunks(
-            self.temporal_attention,
-            query=step_tokens,
-            key=step_tokens,
-            value=step_tokens,
-            chunk_size=self.temporal_attention_chunk_size,
-        )
-        step_tokens = self.temporal_norm(step_tokens + temporal_output)  # [batch_size, history_length, embed_dim]
-
-        mean_token = step_tokens.mean(dim=1)  # [batch_size, embed_dim]
-        last_token = step_tokens[:, -1]  # [batch_size, embed_dim]
-        return torch.cat([mean_token, last_token], dim=-1)  # [batch_size, 2 * embed_dim]
+        neighbor_context = attention_output.squeeze(1)  # [batch_size, embed_dim]
+        return torch.cat([ego_emb, neighbor_context], dim=-1)  # [batch_size, 2 * embed_dim]
 
 
 class _SwarmAttentionGaussianModel(GaussianMixin, Model):
