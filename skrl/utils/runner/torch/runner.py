@@ -100,8 +100,8 @@ class Runner:
         )
         # import custom models
         from skrl.models.torch.custom_models import (
+            MLPPolicy, MLPValue,
             CNNMLPPolicy, CNNMLPValue,
-            MLPIppoPolicy, MLPIppoValue,
             AttentionMLPPolicy, AttentionMLPValue,
             CNNAttentionMLPPolicy, CNNAttentionMLPValue,
         )
@@ -115,10 +115,10 @@ class Runner:
             "multivariategaussianmixin": multivariate_gaussian_model,
             "shared": shared_model,
             # custom models
+            "mlppolicy": MLPPolicy,
+            "mlpvalue": MLPValue,
             "cnnmlppolicy": CNNMLPPolicy,
             "cnnmlpvalue": CNNMLPValue,
-            "mlpippopolicy": MLPIppoPolicy,
-            "mlpippovalue": MLPIppoValue,
             "attentionmlppolicy": AttentionMLPPolicy,
             "attentionmlpvalue": AttentionMLPValue,
             "cnnattentionmlppolicy": CNNAttentionMLPPolicy,
