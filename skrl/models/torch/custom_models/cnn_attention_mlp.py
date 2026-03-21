@@ -46,9 +46,51 @@ from .utils import (
 _CNN_ATTENTION_MLP_REQUIRED_KEYS = {"cnn", "attention", "mlp"}
 # 当前模块输入空间打印优先级（其余键，如动态 other_*，交由自然排序）
 _CNN_ATTENTION_MLP_SPACE_PRIORITY: dict[str, tuple[str, ...]] = {
-    "observation_space": ("image", "ego"),
-    "state_space": ("image", "ego"),
+    "observation_space": ("image", "ego", "others_mask"),
+    "state_space": ("image", "ego", "others_mask"),
 }
+
+
+def _parse_other_shape(other_shape: tuple[int, ...]) -> tuple[int, int]:
+    """解析 `other_*` 输入 shape，返回 `(history_length, other_input_dim)`。"""
+    if len(other_shape) != 2:
+        raise ValueError(
+            "Invalid `other_*` shape: expected (H, D), where H=1 means no history, "
+            f"got {other_shape}"
+        )
+
+    history_length = int(other_shape[0])
+    other_input_dim = int(other_shape[1])
+    if history_length < 1 or other_input_dim < 1:
+        raise ValueError(
+            "Invalid `other_*` shape values: "
+            f"history_length={history_length}, other_input_dim={other_input_dim}"
+        )
+
+    return history_length, other_input_dim
+
+
+# def _extract_attention_key_padding_mask(
+#     data: dict[str, torch.Tensor], num_other: int
+# ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+#     """从输入字典提取 attention 的 key_padding_mask。
+
+#     返回:
+#         - key_padding_mask: 形状 `(batch_size, num_other)`，`True` 表示忽略该 key
+#         - all_masked: 形状 `(batch_size,)`，标记该样本是否所有 key 都被忽略
+#     """
+#     visible_mask = data.get("others_mask")
+#     if visible_mask is None:
+#         return None, None
+
+#     if visible_mask.dim() != 2 or visible_mask.shape[1] != num_other:
+#         raise ValueError(
+#             f"Invalid `others_mask` shape: expected (batch_size, {num_other}), got {tuple(visible_mask.shape)}"
+#         )
+
+#     key_padding_mask = ~(visible_mask > 0.5)
+#     all_masked = key_padding_mask.all(dim=1)
+#     return key_padding_mask, all_masked
 
 
 class CNNAttentionMLPPolicy(GaussianMixin, Model):
@@ -116,6 +158,7 @@ class CNNAttentionMLPPolicy(GaussianMixin, Model):
         # 解析 "other_i" 的数量和 shape，假设它们都是同样的 shape
         self.other_keys = sorted([k for k in observation_space.keys() if k.startswith("other_")])
         other_shape = observation_space[self.other_keys[0]].shape  # 取第一个 "other_i" 的 shape 作为代表
+        self.other_history_length, other_input_dim = _parse_other_shape(other_shape)
         # 解析 "ego" 的 shape
         ego_shape = observation_space["ego"].shape
         # 解析 “image” 的 shape
@@ -125,9 +168,8 @@ class CNNAttentionMLPPolicy(GaussianMixin, Model):
         
         # 模型参数定义
         in_channels = image_shape[0]
-        ego_input_dim   = ego_shape[0]
-        other_input_dim = other_shape[0]
-        action_dim      = action_shape[0]
+        ego_input_dim = ego_shape[0]
+        action_dim = action_shape[0]
 
         # 2. 从 YAML 读取并严格校验网络结构参数
         network_cfg = _normalize_network_root(
@@ -151,7 +193,7 @@ class CNNAttentionMLPPolicy(GaussianMixin, Model):
             dummy_img = torch.zeros((1, *image_shape))
             cnn_out = self.cnn(dummy_img)
             cnn_out_dim = cnn_out.shape[1]
-        fused_input_dim = cnn_out_dim + embed_dim + embed_dim
+        fused_input_dim = cnn_out_dim + embed_dim + embed_dim * self.other_history_length
 
         # 4. 定义 Attention 部分 (用于处理 "other_i" 的特征交互)
         # 这里我们使用一个简单的 MultiheadAttention 来处理 "other_i" 特征之间的关系
@@ -268,24 +310,68 @@ class CNNAttentionMLPPolicy(GaussianMixin, Model):
         ego = observations["ego"]
         other = torch.stack([observations[k] for k in self.other_keys], dim=1)  # 假设 "other_i" 的 key 是按顺序命名的
 
+        # 校验 other 维度
+        if other.dim() != 4:
+            raise ValueError(
+                "Invalid `other_*` tensor shape: expected (batch_size, num_other, history_length, other_dim), "
+                "where history_length=1 means no history, "
+                f"got {tuple(other.shape)}"
+            )
+        batch_size, num_other, other_history_length, other_dim = other.shape
+        if other_history_length != self.other_history_length:
+            raise ValueError(
+                "Temporal `other_*` history length mismatch: expected "
+                f"{self.other_history_length}, got {other_history_length}"
+            )
+
         # 3. CNN 处理图像输入
         img_features = self.cnn(img)
 
         # 4. 计算 "ego" 与 "other" 的 embedding
         ego_embedded = self.ego_embedding(ego)  # (batch_size, embed_dim)
-        other_embedded = self.other_embedding(other)  # (batch_size, num_other, embed_dim)
+        other_embedded = self.other_embedding(
+            other.reshape(batch_size * num_other * other_history_length, other_dim)
+        ).reshape(batch_size, num_other, other_history_length, -1)
+
+        # 5. 提取可见性掩码，并构造 attention 的 key_padding_mask
+        # key_padding_mask, all_masked = _extract_attention_key_padding_mask(observations, len(self.other_keys))
         
-        # 5. 通过 Cross Attention 处理 "ego" 与 "other" 的交互特征
+        # 6. 通过 Cross Attention 处理 "ego" 与 "other" 的交互特征
+        # if key_padding_mask is None:
+        #     attention_output, _ = self.attention(
+        #         query=ego_embedded.unsqueeze(1),
+        #         key=other_embedded,
+        #         value=other_embedded,
+        #     )  # (batch_size, 1, embed_dim)
+        # else:
+        #     valid_rows = ~all_masked
+
+        #     attention_output = torch.zeros(
+        #         ego_embedded.shape[0], 1, ego_embedded.shape[1],
+        #         device=ego_embedded.device, dtype=ego_embedded.dtype
+        #     )
+
+        #     if torch.any(valid_rows):
+        #         attn_out_valid, _ = self.attention(
+        #             query=ego_embedded[valid_rows].unsqueeze(1),
+        #             key=other_embedded[valid_rows],
+        #             value=other_embedded[valid_rows],
+        #             key_padding_mask=key_padding_mask[valid_rows],
+        #         )  # (batch_size, 1, embed_dim)
+        #         attention_output[valid_rows] = attn_out_valid
+
+        other_key_value = other_embedded.permute(0, 2, 1, 3).reshape(batch_size * other_history_length, num_other, -1)
         attention_output, _ = self.attention(
-            query=ego_embedded.unsqueeze(1),
-            key=other_embedded,
-            value=other_embedded,
-        )  # (batch_size, 1, embed_dim)
+            query=ego_embedded.unsqueeze(1).expand(-1, other_history_length, -1).reshape(batch_size * other_history_length, 1, -1),
+            key=other_key_value,
+            value=other_key_value,
+        )
+        attention_output = attention_output.squeeze(1).reshape(batch_size, other_history_length, -1).reshape(batch_size, -1)
 
-        # 6. 融合图像特征与交互特征后输入 MLP
-        combined = torch.cat([img_features, ego_embedded, attention_output.squeeze(1)], dim=1)  # (batch_size, (cnn_out_dim + embed_dim + embed_dim))
+        # 7. 融合图像特征与交互特征后输入 MLP
+        combined = torch.cat([img_features, ego_embedded, attention_output], dim=1)  # (batch_size, (cnn_out_dim + embed_dim + embed_dim * history_length))
 
-        # 7. 通过 MLP 计算 action 均值
+        # 8. 通过 MLP 计算 action 均值
         output = self.mlp(combined)
 
         return output, {"log_std": self.log_std_parameter}
@@ -338,6 +424,7 @@ class CNNAttentionMLPValue(DeterministicMixin, Model):
         # 解析 "other_i" 的数量和 shape，假设它们都是同样的 shape
         self.other_keys = sorted([k for k in state_space.keys() if k.startswith("other_")])
         other_shape = state_space[self.other_keys[0]].shape  # 取第一个 "other_i" 的 shape 作为代表
+        self.other_history_length, other_input_dim = _parse_other_shape(other_shape)
         # 解析 "ego" 的 shape
         ego_shape = state_space["ego"].shape
         # 解析 “image” 的 shape
@@ -345,8 +432,7 @@ class CNNAttentionMLPValue(DeterministicMixin, Model):
         
         # 模型参数定义
         in_channels = image_shape[0]
-        ego_input_dim   = ego_shape[0]
-        other_input_dim = other_shape[0]
+        ego_input_dim = ego_shape[0]
 
         # 2. 从 YAML 读取并严格校验网络结构参数
         network_cfg = _normalize_network_root(
@@ -370,7 +456,7 @@ class CNNAttentionMLPValue(DeterministicMixin, Model):
             dummy_img = torch.zeros((1, *image_shape))
             cnn_out = self.cnn(dummy_img)
             cnn_out_dim = cnn_out.shape[1]
-        fused_input_dim = cnn_out_dim + embed_dim + embed_dim
+        fused_input_dim = cnn_out_dim + embed_dim + embed_dim * self.other_history_length
 
         # 4. 定义 Attention 部分 (用于处理 "other_i" 的特征交互)
         # 这里我们使用一个简单的 MultiheadAttention 来处理 "other_i" 特征之间的关系
@@ -471,24 +557,68 @@ class CNNAttentionMLPValue(DeterministicMixin, Model):
         ego = states["ego"]
         other = torch.stack([states[k] for k in self.other_keys], dim=1)  # 假设 "other_i" 的 key 是按顺序命名的
 
+        # 校验 other 维度
+        if other.dim() != 4:
+            raise ValueError(
+                "Invalid `other_*` tensor shape: expected (batch_size, num_other, history_length, other_dim), "
+                "where history_length=1 means no history, "
+                f"got {tuple(other.shape)}"
+            )
+        batch_size, num_other, other_history_length, other_dim = other.shape
+        if other_history_length != self.other_history_length:
+            raise ValueError(
+                "Temporal `other_*` history length mismatch: expected "
+                f"{self.other_history_length}, got {other_history_length}"
+            )
+
         # 3. CNN 处理图像输入
         img_features = self.cnn(img)
 
         # 4. 计算 "ego" 与 "other" 的 embedding
         ego_embedded = self.ego_embedding(ego)  # (batch_size, embed_dim)
-        other_embedded = self.other_embedding(other)  # (batch_size, num_other, embed_dim)
+        other_embedded = self.other_embedding(
+            other.reshape(batch_size * num_other * other_history_length, other_dim)
+        ).reshape(batch_size, num_other, other_history_length, -1)
+
+        # 5. 提取可见性掩码，并构造 attention 的 key_padding_mask
+        # key_padding_mask, all_masked = _extract_attention_key_padding_mask(states, len(self.other_keys))
         
-        # 5. 通过 Cross Attention 处理 "ego" 与 "other" 的交互特征
+        # 6. 通过 Cross Attention 处理 "ego" 与 "other" 的交互特征
+        # if key_padding_mask is None:
+        #     attention_output, _ = self.attention(
+        #         query=ego_embedded.unsqueeze(1),
+        #         key=other_embedded,
+        #         value=other_embedded,
+        #     )  # (batch_size, 1, embed_dim)
+        # else:
+        #     valid_rows = ~all_masked
+
+        #     attention_output = torch.zeros(
+        #         ego_embedded.shape[0], 1, ego_embedded.shape[1],
+        #         device=ego_embedded.device, dtype=ego_embedded.dtype
+        #     )
+
+        #     if torch.any(valid_rows):
+        #         attn_out_valid, _ = self.attention(
+        #             query=ego_embedded[valid_rows].unsqueeze(1),
+        #             key=other_embedded[valid_rows],
+        #             value=other_embedded[valid_rows],
+        #             key_padding_mask=key_padding_mask[valid_rows],
+        #         )  # (batch_size, 1, embed_dim)
+        #         attention_output[valid_rows] = attn_out_valid
+
+        other_key_value = other_embedded.permute(0, 2, 1, 3).reshape(batch_size * other_history_length, num_other, -1)
         attention_output, _ = self.attention(
-            query=ego_embedded.unsqueeze(1),
-            key=other_embedded,
-            value=other_embedded,
-        )  # (batch_size, 1, embed_dim)
+            query=ego_embedded.unsqueeze(1).expand(-1, other_history_length, -1).reshape(batch_size * other_history_length, 1, -1),
+            key=other_key_value,
+            value=other_key_value,
+        )
+        attention_output = attention_output.squeeze(1).reshape(batch_size, other_history_length, -1).reshape(batch_size, -1)
 
-        # 6. 融合图像特征与交互特征后输入 MLP
-        combined = torch.cat([img_features, ego_embedded, attention_output.squeeze(1)], dim=1)  # (batch_size, (cnn_out_dim + embed_dim + embed_dim))
+        # 7. 融合图像特征与交互特征后输入 MLP
+        combined = torch.cat([img_features, ego_embedded, attention_output], dim=1)  # (batch_size, (cnn_out_dim + embed_dim + embed_dim * history_length))
 
-        # 7. 通过 MLP 计算 value
+        # 8. 通过 MLP 计算 value
         output = self.mlp(combined)
 
         return output, {}
