@@ -36,6 +36,18 @@ class PPO_CFG(AgentCfg):
     * If a tuple is provided, its elements will be used for each network in order.
     """
 
+    optimizer: str | type = "Adam"
+    """Optimizer class name or class used for the policy/value update."""
+
+    optimizer_kwargs: dict = dataclasses.field(default_factory=dict)
+    """Keyword arguments forwarded to the optimizer constructor.
+
+    .. warning::
+
+        The ``params`` and ``lr`` arguments are automatically passed to the optimizer's constructor.
+        Therefore, they must not be provided in the keyword arguments.
+    """
+
     learning_rate_scheduler: type | tuple[type | None, type | None] | None = None
     """Learning rate scheduler class for the policy and value networks.
 
@@ -140,6 +152,9 @@ class PPO_CFG(AgentCfg):
         # learning rate
         if not isinstance(self.learning_rate, (tuple, list)):
             self.learning_rate = (self.learning_rate, self.learning_rate)
+        # optimizer kwargs
+        if self.optimizer_kwargs is None:
+            self.optimizer_kwargs = {}
         # learning rate scheduler
         if self.learning_rate_scheduler is None:
             self.learning_rate_scheduler = (None, None)

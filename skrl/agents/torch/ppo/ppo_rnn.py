@@ -125,11 +125,22 @@ class PPO_RNN(Agent):
         # set up optimizer and learning rate scheduler
         if self.policy is not None and self.value is not None:
             # - optimizers
-            if self.policy is self.value:
-                self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=self.cfg.learning_rate[0])
+            optimizer_cfg = self.cfg.optimizer
+            if isinstance(optimizer_cfg, str):
+                try:
+                    optimizer_cls = getattr(torch.optim, optimizer_cfg)
+                except AttributeError as e:
+                    raise ValueError(f"Unknown optimizer '{optimizer_cfg}' for PPO_RNN") from e
             else:
-                self.optimizer = torch.optim.Adam(
-                    itertools.chain(self.policy.parameters(), self.value.parameters()), lr=self.cfg.learning_rate[0]
+                optimizer_cls = optimizer_cfg
+            optimizer_kwargs = dict(self.cfg.optimizer_kwargs)
+            if self.policy is self.value:
+                self.optimizer = optimizer_cls(self.policy.parameters(), lr=self.cfg.learning_rate[0], **optimizer_kwargs)
+            else:
+                self.optimizer = optimizer_cls(
+                    itertools.chain(self.policy.parameters(), self.value.parameters()),
+                    lr=self.cfg.learning_rate[0],
+                    **optimizer_kwargs,
                 )
             self.checkpoint_modules["optimizer"] = self.optimizer
             # - learning rate schedulers
