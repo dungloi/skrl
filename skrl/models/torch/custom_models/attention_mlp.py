@@ -46,9 +46,28 @@ from .utils import (
 _ATTENTION_MLP_REQUIRED_KEYS = {"attention", "embedding", "mlp"}
 # 当前模块输入空间打印优先级（其余键，如动态 other_*，交由自然排序）
 _ATTENTION_MLP_SPACE_PRIORITY: dict[str, tuple[str, ...]] = {
-    "observation_space": ("ego",),
-    "state_space": ("ego",),
+    "observation_space": ("ego", "others_mask"),
+    "state_space": ("ego", "others_mask"),
 }
+
+
+def _parse_other_shape(other_shape: tuple[int, ...]) -> tuple[int, int]:
+    """解析 `other_*` 输入 shape，返回 `(history_length, other_input_dim)`。"""
+    if len(other_shape) != 2:
+        raise ValueError(
+            "Invalid `other_*` shape: expected (H, D), where H=1 means no history, "
+            f"got {other_shape}"
+        )
+
+    history_length = int(other_shape[0])
+    other_input_dim = int(other_shape[1])
+    if history_length < 1 or other_input_dim < 1:
+        raise ValueError(
+            "Invalid `other_*` shape values: "
+            f"history_length={history_length}, other_input_dim={other_input_dim}"
+        )
+
+    return history_length, other_input_dim
 
 
 class AttentionMLPPolicy(GaussianMixin, Model):
@@ -79,7 +98,8 @@ class AttentionMLPPolicy(GaussianMixin, Model):
         """初始化 attention-based Gaussian policy。
 
         Args:
-            observation_space: 包含 `ego` 与 `other_*` 的 Dict space。
+            observation_space: 包含 `ego` 与 `other_*` 的 Dict space，
+                其中 `other_*` shape 期望为 `(history_length, feature_dim)`。
             state_space: State space（为接口一致性保留）。
             action_space: 连续动作空间。
             device: 目标 torch device。
@@ -116,16 +136,15 @@ class AttentionMLPPolicy(GaussianMixin, Model):
         # 解析 "other_i" 的数量和 shape，假设它们都是同样的 shape
         self.other_keys = sorted([k for k in observation_space.keys() if k.startswith("other_")])
         other_shape = observation_space[self.other_keys[0]].shape  # 取第一个 "other_i" 的 shape 作为代表
+        self.other_history_length, other_input_dim = _parse_other_shape(other_shape)
         # 解析 "ego" 的 shape
         ego_shape = observation_space["ego"].shape
         # 解析 action space shape
         action_shape = action_space.shape
-        
+
         # 模型参数定义
-        ego_input_dim   = ego_shape[0]
-        other_input_dim = other_shape[0]
-        action_dim      = action_shape[0]
-        combined_input_dim = 0
+        ego_input_dim = ego_shape[0]
+        action_dim = action_shape[0]
 
         # 2. 从 YAML 读取并严格校验网络结构参数
         network_cfg = _normalize_network_root(
@@ -139,7 +158,7 @@ class AttentionMLPPolicy(GaussianMixin, Model):
 
         embed_dim = attention_cfg["embed_dim"]
         num_heads = attention_cfg["num_heads"]
-        combined_input_dim = embed_dim + embed_dim
+        fused_input_dim = embed_dim + embed_dim * self.other_history_length
 
         # 3. 定义 Attention 部分 (用于处理 "other_i" 的特征交互)
         # 这里我们使用一个简单的 MultiheadAttention 来处理 "other_i" 特征之间的关系
@@ -165,7 +184,7 @@ class AttentionMLPPolicy(GaussianMixin, Model):
 
         # 5. 按配置构建 MLP (特征 -> Action)
         self.mlp = _build_mlp(
-            input_dim=combined_input_dim,
+            input_dim=fused_input_dim,
             hidden_dims=mlp_cfg["hidden_dims"],
             output_dim=action_dim,
             use_layernorm=mlp_cfg["use_layernorm"],
@@ -203,6 +222,7 @@ class AttentionMLPPolicy(GaussianMixin, Model):
         _print_section("Parsed Shapes")
         _print_kv("ego_shape", ego_shape)
         _print_kv("other_shape", other_shape)
+        _print_kv("other_history_length", self.other_history_length)
         _print_kv("num_other", len(self.other_keys))
         _print_kv("action_shape", action_shape)
 
@@ -233,7 +253,7 @@ class AttentionMLPPolicy(GaussianMixin, Model):
         )
 
         _print_section("Derived Dims")
-        _print_kv("combined_input_dim", combined_input_dim)
+        _print_kv("fused_input_dim", fused_input_dim)
         _print_block_footer(f"[{self.__class__.__name__}] Ready")
 
     def compute(self, inputs, role=""):
@@ -252,19 +272,43 @@ class AttentionMLPPolicy(GaussianMixin, Model):
         ego = observations["ego"]
         other = torch.stack([observations[k] for k in self.other_keys], dim=1)  # 假设 "other_i" 的 key 是按顺序命名的
 
+        # 校验 other 维度
+        if other.dim() != 4:
+            raise ValueError(
+                "Invalid `other_*` tensor shape: expected (batch_size, num_other, history_length, other_dim), "
+                "where history_length=1 means no history, "
+                f"got {tuple(other.shape)}"
+            )
+        batch_size, num_other, other_history_length, other_dim = other.shape
+        if other_history_length != self.other_history_length:
+            raise ValueError(
+                "Temporal `other_*` history length mismatch: expected "
+                f"{self.other_history_length}, got {other_history_length}"
+            )
+
         # 2. 计算 "ego" 与 "other" 的 embedding
         ego_embedded = self.ego_embedding(ego)  # (batch_size, embed_dim)
-        other_embedded = self.other_embedding(other)  # (batch_size, num_other, embed_dim)
-        
+        other_embedded = self.other_embedding(
+            other.reshape(batch_size * num_other * other_history_length, other_dim)
+        ).reshape(batch_size, num_other, other_history_length, -1)
+
         # 3. 通过 Cross Attention 处理 "ego" 与 "other" 的交互特征
+        other_key_value = other_embedded.permute(0, 2, 1, 3).reshape(
+            batch_size * other_history_length, num_other, -1
+        )
         attention_output, _ = self.attention(
-            query=ego_embedded.unsqueeze(1),
-            key=other_embedded,
-            value=other_embedded,
-        )  # (batch_size, 1, embed_dim)
+            query=ego_embedded.unsqueeze(1).expand(-1, other_history_length, -1).reshape(
+                batch_size * other_history_length, 1, -1
+            ),
+            key=other_key_value,
+            value=other_key_value,
+        )
+        attention_output = attention_output.squeeze(1).reshape(batch_size, other_history_length, -1).reshape(
+            batch_size, -1
+        )
 
         # 4. 融合特征后输入 MLP
-        combined = torch.cat([ego_embedded, attention_output.squeeze(1)], dim=1)  # (batch_size, (embed_dim + embed_dim))
+        combined = torch.cat([ego_embedded, attention_output], dim=1)
 
         # 5. 通过 MLP 计算 action 均值
         output = self.mlp(combined)
@@ -294,7 +338,8 @@ class AttentionMLPValue(DeterministicMixin, Model):
 
         Args:
             observation_space: Observation space（为接口一致性保留）。
-            state_space: 包含 `ego` 与 `other_*` 的 Dict space。
+            state_space: 包含 `ego` 与 `other_*` 的 Dict space，
+                其中 `other_*` shape 期望为 `(history_length, feature_dim)`。
             action_space: skrl 接口使用的动作空间。
             device: 目标 torch device。
             clip_actions: deterministic mixin 中是否裁剪动作。
@@ -319,13 +364,12 @@ class AttentionMLPValue(DeterministicMixin, Model):
         # 解析 "other_i" 的数量和 shape，假设它们都是同样的 shape
         self.other_keys = sorted([k for k in state_space.keys() if k.startswith("other_")])
         other_shape = state_space[self.other_keys[0]].shape  # 取第一个 "other_i" 的 shape 作为代表
+        self.other_history_length, other_input_dim = _parse_other_shape(other_shape)
         # 解析 "ego" 的 shape
         ego_shape = state_space["ego"].shape
-        
+
         # 模型参数定义
-        ego_input_dim   = ego_shape[0]
-        other_input_dim = other_shape[0]
-        combined_input_dim = 0
+        ego_input_dim = ego_shape[0]
 
         # 2. 从 YAML 读取并严格校验网络结构参数
         network_cfg = _normalize_network_root(
@@ -339,7 +383,7 @@ class AttentionMLPValue(DeterministicMixin, Model):
 
         embed_dim = attention_cfg["embed_dim"]
         num_heads = attention_cfg["num_heads"]
-        combined_input_dim = embed_dim + embed_dim
+        fused_input_dim = embed_dim + embed_dim * self.other_history_length
 
         # 3. 定义 Attention 部分 (用于处理 "other_i" 的特征交互)
         # 这里我们使用一个简单的 MultiheadAttention 来处理 "other_i" 特征之间的关系
@@ -365,7 +409,7 @@ class AttentionMLPValue(DeterministicMixin, Model):
 
         # 5. 按配置构建 MLP (特征 -> Value)
         self.mlp = _build_mlp(
-            input_dim=combined_input_dim,
+            input_dim=fused_input_dim,
             hidden_dims=mlp_cfg["hidden_dims"],
             output_dim=1,
             use_layernorm=mlp_cfg["use_layernorm"],
@@ -388,6 +432,7 @@ class AttentionMLPValue(DeterministicMixin, Model):
         _print_section("Parsed Shapes")
         _print_kv("ego_shape", ego_shape)
         _print_kv("other_shape", other_shape)
+        _print_kv("other_history_length", self.other_history_length)
         _print_kv("num_other", len(self.other_keys))
 
         _print_section("Network Config")
@@ -417,7 +462,7 @@ class AttentionMLPValue(DeterministicMixin, Model):
         )
 
         _print_section("Derived Dims")
-        _print_kv("combined_input_dim", combined_input_dim)
+        _print_kv("fused_input_dim", fused_input_dim)
         _print_kv("output_dim", 1)
         _print_block_footer(f"[{self.__class__.__name__}] Ready")
 
@@ -436,19 +481,43 @@ class AttentionMLPValue(DeterministicMixin, Model):
         ego = states["ego"]
         other = torch.stack([states[k] for k in self.other_keys], dim=1)  # 假设 "other_i" 的 key 是按顺序命名的
 
+        # 校验 other 维度
+        if other.dim() != 4:
+            raise ValueError(
+                "Invalid `other_*` tensor shape: expected (batch_size, num_other, history_length, other_dim), "
+                "where history_length=1 means no history, "
+                f"got {tuple(other.shape)}"
+            )
+        batch_size, num_other, other_history_length, other_dim = other.shape
+        if other_history_length != self.other_history_length:
+            raise ValueError(
+                "Temporal `other_*` history length mismatch: expected "
+                f"{self.other_history_length}, got {other_history_length}"
+            )
+
         # 2. 计算 "ego" 与 "other" 的 embedding
         ego_embedded = self.ego_embedding(ego)  # (batch_size, embed_dim)
-        other_embedded = self.other_embedding(other)  # (batch_size, num_other, embed_dim)
-        
+        other_embedded = self.other_embedding(
+            other.reshape(batch_size * num_other * other_history_length, other_dim)
+        ).reshape(batch_size, num_other, other_history_length, -1)
+
         # 3. 通过 Cross Attention 处理 "ego" 与 "other" 的交互特征
+        other_key_value = other_embedded.permute(0, 2, 1, 3).reshape(
+            batch_size * other_history_length, num_other, -1
+        )
         attention_output, _ = self.attention(
-            query=ego_embedded.unsqueeze(1),
-            key=other_embedded,
-            value=other_embedded,
-        )  # (batch_size, 1, embed_dim)
+            query=ego_embedded.unsqueeze(1).expand(-1, other_history_length, -1).reshape(
+                batch_size * other_history_length, 1, -1
+            ),
+            key=other_key_value,
+            value=other_key_value,
+        )
+        attention_output = attention_output.squeeze(1).reshape(batch_size, other_history_length, -1).reshape(
+            batch_size, -1
+        )
 
         # 4. 融合特征后输入 MLP
-        combined = torch.cat([ego_embedded, attention_output.squeeze(1)], dim=1)  # (batch_size, (embed_dim + embed_dim))
+        combined = torch.cat([ego_embedded, attention_output], dim=1)
 
         # 5. 通过 MLP 计算 value
         output = self.mlp(combined)
