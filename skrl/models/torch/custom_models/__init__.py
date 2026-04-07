@@ -20,6 +20,8 @@
 from .attention_mlp import AttentionMLPPolicy, AttentionMLPValue
 # CNN + Attention + MLP：图像与交互联合建模
 from .cnn_attention_mlp import CNNAttentionMLPPolicy, CNNAttentionMLPValue
+# CNN + GRU + Attention + MLP：图像时序记忆与交互联合建模
+from .cnn_gru_attention_mlp import CNNGRUAttentionMLPPolicy, CNNGRUAttentionMLPValue
 # CNN + MLP：图像与状态特征融合
 from .cnn_mlp import CNNMLPPolicy, CNNMLPValue
 # MLP：纯向量输入
@@ -38,4 +40,7 @@ __all__ = [
     # CNN + Attention + MLP
     "CNNAttentionMLPPolicy",
     "CNNAttentionMLPValue",
+    # CNN + GRU + Attention + MLP
+    "CNNGRUAttentionMLPPolicy",
+    "CNNGRUAttentionMLPValue",
 ]

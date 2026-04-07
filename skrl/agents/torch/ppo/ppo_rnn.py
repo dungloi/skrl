@@ -459,6 +459,26 @@ class PPO_RNN(Agent):
         cumulative_policy_loss = 0
         cumulative_entropy_loss = 0
         cumulative_value_loss = 0
+        cumulative_approx_kl = 0
+        cumulative_clip_fraction = 0
+        cumulative_clip_magnitude = 0
+        cumulative_is_ratio_sum = 0
+        cumulative_is_ratio_sumsq = 0
+        cumulative_entropy = 0
+        cumulative_value_clip_fraction = 0
+        cumulative_grad_norm = 0
+        max_approx_kl = float("-inf")
+        kl_early_stop_count = 0
+        observed_minibatches = 0
+        observed_samples = 0
+        effective_minibatches = 0
+        effective_samples = 0
+        entropy_samples = 0
+        explained_variance_samples = 0
+        explained_variance_returns_sum = 0
+        explained_variance_returns_sumsq = 0
+        explained_variance_residual_sum = 0
+        explained_variance_residual_sumsq = 0
 
         # learning epochs
         for epoch in range(self.cfg.learning_epochs):
@@ -515,39 +535,76 @@ class PPO_RNN(Agent):
                         {**inputs, "taken_actions": sampled_actions, **rnn_policy}, role="policy"
                     )
                     next_log_prob = outputs["log_prob"]
+                    lower, upper = 1.0 - self.cfg.ratio_clip, 1.0 + self.cfg.ratio_clip
+                    log_ratio = next_log_prob - sampled_log_prob
+                    ratio = torch.exp(log_ratio)
 
                     # compute approximate KL divergence
                     with torch.no_grad():
-                        ratio = next_log_prob - sampled_log_prob
-                        kl_divergence = ((torch.exp(ratio) - 1) - ratio).mean()
+                        ratio_detached = ratio.detach().float()
+                        log_ratio_detached = log_ratio.detach().float()
+                        kl_divergence = ((ratio_detached - 1) - log_ratio_detached).mean()
                         kl_divergences.append(kl_divergence)
+                        ratio_clipped_detached = torch.clip(ratio_detached, lower, upper)
+                        clip_fraction = (torch.abs(ratio_detached - 1.0) > self.cfg.ratio_clip).float().mean()
+                        clip_magnitude = torch.abs(ratio_detached - ratio_clipped_detached).mean()
+                        observed_batch_samples = ratio_detached.numel()
+                        is_ratio_sum = ratio_detached.sum()
+                        is_ratio_sumsq = ratio_detached.pow(2).sum()
+
+                    observed_minibatches += 1
+                    kl_value = kl_divergence.item()
+                    observed_samples += observed_batch_samples
+                    cumulative_approx_kl += kl_value * observed_batch_samples
+                    max_approx_kl = max(max_approx_kl, kl_value)
+                    cumulative_clip_fraction += clip_fraction.item() * observed_batch_samples
+                    cumulative_clip_magnitude += clip_magnitude.item() * observed_batch_samples
+                    cumulative_is_ratio_sum += is_ratio_sum.item()
+                    cumulative_is_ratio_sumsq += is_ratio_sumsq.item()
 
                     # early stopping with KL divergence
                     if self.cfg.kl_threshold and kl_divergence > self.cfg.kl_threshold:
+                        kl_early_stop_count += 1
                         break
 
                     # compute entropy loss
+                    entropy_tensor = self.policy.get_entropy(role="policy")
+                    entropy = entropy_tensor.mean()
+                    entropy_batch_samples = entropy_tensor.numel()
                     if self.cfg.entropy_loss_scale:
-                        entropy_loss = -self.cfg.entropy_loss_scale * self.policy.get_entropy(role="policy").mean()
+                        entropy_loss = -self.cfg.entropy_loss_scale * entropy
                     else:
                         entropy_loss = 0
 
                     # compute policy loss
-                    ratio = torch.exp(next_log_prob - sampled_log_prob)
                     surrogate = sampled_advantages * ratio
-                    surrogate_clipped = sampled_advantages * torch.clip(
-                        ratio, 1.0 - self.cfg.ratio_clip, 1.0 + self.cfg.ratio_clip
-                    )
+                    surrogate_clipped = sampled_advantages * torch.clip(ratio, lower, upper)
 
                     policy_loss = -torch.min(surrogate, surrogate_clipped).mean()
 
                     # compute value loss
-                    predicted_values, _ = self.value.act({**inputs, **rnn_value}, role="value")
+                    predicted_values_raw, _ = self.value.act({**inputs, **rnn_value}, role="value")
+
+                    with torch.no_grad():
+                        returns_detached = sampled_returns.detach().float()
+                        predicted_values_detached = predicted_values_raw.detach().float()
+                        residual_detached = returns_detached - predicted_values_detached
+                        explained_variance_batch_samples = returns_detached.numel()
+                        explained_variance_returns_sum += returns_detached.sum().item()
+                        explained_variance_returns_sumsq += returns_detached.pow(2).sum().item()
+                        explained_variance_residual_sum += residual_detached.sum().item()
+                        explained_variance_residual_sumsq += residual_detached.pow(2).sum().item()
 
                     if self.cfg.value_clip > 0:
+                        value_delta = predicted_values_raw - sampled_values
+                        with torch.no_grad():
+                            value_clip_fraction = (torch.abs(value_delta) > self.cfg.value_clip).float().mean()
                         predicted_values = sampled_values + torch.clip(
-                            predicted_values - sampled_values, min=-self.cfg.value_clip, max=self.cfg.value_clip
+                            value_delta, min=-self.cfg.value_clip, max=self.cfg.value_clip
                         )
+                    else:
+                        predicted_values = predicted_values_raw
+                        value_clip_fraction = torch.zeros((), device=sampled_values.device)
                     value_loss = self.cfg.value_loss_scale * F.mse_loss(sampled_returns, predicted_values)
 
                 # optimization step
@@ -559,14 +616,20 @@ class PPO_RNN(Agent):
                     if self.policy is not self.value:
                         self.value.reduce_parameters()
 
+                self.scaler.unscale_(self.optimizer)
+                if self.policy is self.value:
+                    grad_parameters = tuple(self.policy.parameters())
+                else:
+                    grad_parameters = tuple(itertools.chain(self.policy.parameters(), self.value.parameters()))
+
                 if self.cfg.grad_norm_clip > 0:
-                    self.scaler.unscale_(self.optimizer)
-                    if self.policy is self.value:
-                        nn.utils.clip_grad_norm_(self.policy.parameters(), self.cfg.grad_norm_clip)
-                    else:
-                        nn.utils.clip_grad_norm_(
-                            itertools.chain(self.policy.parameters(), self.value.parameters()), self.cfg.grad_norm_clip
-                        )
+                    grad_norm = nn.utils.clip_grad_norm_(grad_parameters, self.cfg.grad_norm_clip)
+                else:
+                    grad_norm = torch.zeros((), device=self.device)
+                    for parameter in grad_parameters:
+                        if parameter.grad is not None:
+                            grad_norm += parameter.grad.detach().pow(2).sum()
+                    grad_norm = torch.sqrt(grad_norm)
 
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
@@ -576,11 +639,21 @@ class PPO_RNN(Agent):
                 cumulative_value_loss += value_loss.item()
                 if self.cfg.entropy_loss_scale:
                     cumulative_entropy_loss += entropy_loss.item()
+                cumulative_entropy += entropy.item() * entropy_batch_samples
+                entropy_samples += entropy_batch_samples
+                cumulative_value_clip_fraction += value_clip_fraction.item() * explained_variance_batch_samples
+                cumulative_grad_norm += grad_norm.item()
+                effective_minibatches += 1
+                effective_samples += explained_variance_batch_samples
+                explained_variance_samples += explained_variance_batch_samples
 
             # update learning rate
             if self.scheduler:
                 if isinstance(self.scheduler, KLAdaptiveLR):
-                    kl = torch.tensor(kl_divergences, device=self.device).mean()
+                    if kl_divergences:
+                        kl = torch.stack(kl_divergences).mean()
+                    else:
+                        kl = torch.zeros((), device=self.device)
                     # reduce (collect from all workers/processes) KL in distributed runs
                     if config.torch.is_distributed:
                         torch.distributed.all_reduce(kl, op=torch.distributed.ReduceOp.SUM)
@@ -590,16 +663,44 @@ class PPO_RNN(Agent):
                     self.scheduler.step()
 
         # record data
-        self.track_data(
-            "Loss / Policy loss", cumulative_policy_loss / (self.cfg.learning_epochs * self.cfg.mini_batches)
-        )
-        self.track_data("Loss / Value loss", cumulative_value_loss / (self.cfg.learning_epochs * self.cfg.mini_batches))
+        observed_samples_safe = max(observed_samples, 1)
+        effective_minibatches_safe = max(effective_minibatches, 1)
+        effective_samples_safe = max(effective_samples, 1)
+        entropy_samples_safe = max(entropy_samples, 1)
+        self.track_data("Loss / Policy loss", cumulative_policy_loss / effective_minibatches_safe)
+        self.track_data("Loss / Value loss", cumulative_value_loss / effective_minibatches_safe)
         if self.cfg.entropy_loss_scale:
-            self.track_data(
-                "Loss / Entropy loss", cumulative_entropy_loss / (self.cfg.learning_epochs * self.cfg.mini_batches)
-            )
+            self.track_data("Loss / Entropy loss", cumulative_entropy_loss / effective_minibatches_safe)
 
+        is_ratio_mean = cumulative_is_ratio_sum / observed_samples_safe
+        is_ratio_var = max(cumulative_is_ratio_sumsq / observed_samples_safe - is_ratio_mean * is_ratio_mean, 0.0)
+        explained_variance = 0.0
+        if explained_variance_samples:
+            returns_mean = explained_variance_returns_sum / explained_variance_samples
+            returns_var = (
+                explained_variance_returns_sumsq / explained_variance_samples - returns_mean * returns_mean
+            )
+            if returns_var > 1e-8:
+                residual_mean = explained_variance_residual_sum / explained_variance_samples
+                residual_var = (
+                    explained_variance_residual_sumsq / explained_variance_samples - residual_mean * residual_mean
+                )
+                explained_variance = 1.0 - residual_var / (returns_var + 1e-8)
+
+        self.track_data("Policy / Approx KL", cumulative_approx_kl / observed_samples_safe)
+        self.track_data("Policy / Approx KL (max)", max_approx_kl if max_approx_kl > float("-inf") else 0.0)
+        self.track_data("Policy / Clip fraction", cumulative_clip_fraction / observed_samples_safe)
+        self.track_data("Policy / Clip magnitude", cumulative_clip_magnitude / observed_samples_safe)
+        self.track_data("Policy / IS ratio (mean)", is_ratio_mean)
+        self.track_data("Policy / IS ratio (std)", is_ratio_var**0.5)
+        self.track_data("Policy / Entropy", cumulative_entropy / entropy_samples_safe)
         self.track_data("Policy / Standard deviation", self.policy.distribution(role="policy").stddev.mean().item())
+        self.track_data("Value / Explained variance", explained_variance)
+        self.track_data("Value / Clip fraction", cumulative_value_clip_fraction / effective_samples_safe)
+        self.track_data("Optimization / Grad norm", cumulative_grad_norm / effective_minibatches_safe)
+        self.track_data("Optimization / KL early-stop count", kl_early_stop_count)
+        self.track_data("Optimization / Effective minibatches", effective_minibatches)
+        self.track_data("Optimization / Observed minibatches", observed_minibatches)
 
         if self.scheduler:
             self.track_data("Learning / Learning rate", self.scheduler.get_last_lr()[0])

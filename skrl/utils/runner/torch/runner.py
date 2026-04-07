@@ -81,7 +81,7 @@ class Runner:
         from skrl.agents.torch.ddpg import DDPG, DDPG_CFG
         from skrl.agents.torch.ddqn import DDQN, DDQN_CFG
         from skrl.agents.torch.dqn import DQN, DQN_CFG
-        from skrl.agents.torch.ppo import PPO, PPO_CFG
+        from skrl.agents.torch.ppo import PPO, PPO_RNN, PPO_CFG
         from skrl.agents.torch.rpo import RPO, RPO_CFG
         from skrl.agents.torch.sac import SAC, SAC_CFG
         from skrl.agents.torch.td3 import TD3, TD3_CFG
@@ -104,6 +104,7 @@ class Runner:
             CNNMLPPolicy, CNNMLPValue,
             AttentionMLPPolicy, AttentionMLPValue,
             CNNAttentionMLPPolicy, CNNAttentionMLPValue,
+            CNNGRUAttentionMLPPolicy, CNNGRUAttentionMLPValue,
         )
 
         component = {
@@ -123,6 +124,8 @@ class Runner:
             "attentionmlpvalue": AttentionMLPValue,
             "cnnattentionmlppolicy": CNNAttentionMLPPolicy,
             "cnnattentionmlpvalue": CNNAttentionMLPValue,
+            "cnngruattentionmlppolicy": CNNGRUAttentionMLPPolicy,
+            "cnngruattentionmlpvalue": CNNGRUAttentionMLPValue,
             # memories
             "randommemory": RandomMemory,
             # agents
@@ -140,6 +143,8 @@ class Runner:
             "dqn_cfg": DQN_CFG,
             "ppo": PPO,
             "ppo_cfg": PPO_CFG,
+            "ppo_rnn": PPO_RNN,
+            "ppo_rnn_cfg": PPO_CFG,
             "rpo": RPO,
             "rpo_cfg": RPO_CFG,
             "sac": SAC,
@@ -230,6 +235,7 @@ class Runner:
         """
         multi_agent = isinstance(env, MultiAgentEnvWrapper)
         device = env.device
+        num_envs = env.num_envs
         possible_agents = env.possible_agents if multi_agent else ["agent"]
         observation_spaces = env.observation_spaces if multi_agent else {"agent": env.observation_space}
         state_spaces = env.state_spaces if multi_agent else {"agent": env.state_space}
@@ -277,6 +283,9 @@ class Runner:
                             logger.warning(
                                 "Unable to get AMP space via 'env.amp_observation_space'. Using 'env.observation_space' instead"
                             )
+                    model_kwargs = self._process_cfg(models_cfg[role])
+                    if agent_class == "ppo_rnn":
+                        model_kwargs.setdefault("num_envs", num_envs)
                     # print model source
                     if self._verbose:
                         # 判断 model_class 为【自定义模型类】还是【模型实例化函数】
@@ -288,7 +297,7 @@ class Runner:
                                 state_space=state_spaces[agent_id],
                                 action_space=action_spaces[agent_id],
                                 device=device,
-                                **self._process_cfg(models_cfg[role]),
+                                **model_kwargs,
                                 return_source=True,
                             )
                         print("==================================================")
@@ -302,7 +311,7 @@ class Runner:
                         state_space=state_spaces[agent_id],
                         action_space=action_spaces[agent_id],
                         device=device,
-                        **self._process_cfg(models_cfg[role]),
+                        **model_kwargs,
                     )
             # shared models
             else:
@@ -449,7 +458,7 @@ class Runner:
                 "reply_buffer": reply_buffer,
                 "collect_reference_motions": lambda num_samples: env.collect_reference_motions(num_samples),
             }
-        elif agent_class in ["a2c", "cem", "ddpg", "ddqn", "dqn", "ppo", "rpo", "sac", "td3", "trpo"]:
+        elif agent_class in ["a2c", "cem", "ddpg", "ddqn", "dqn", "ppo", "ppo_rnn", "rpo", "sac", "td3", "trpo"]:
             agent_id = possible_agents[0]
             agent_cfg = dataclasses.asdict(self._component(f"{agent_class}_CFG")(**self._process_cfg(cfg["agent"])))
             agent_cfg.get("observation_preprocessor_kwargs", {}).update(

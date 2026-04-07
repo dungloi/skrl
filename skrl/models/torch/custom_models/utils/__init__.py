@@ -26,6 +26,7 @@ from .config import (
     _normalize_attention_cfg,
     _normalize_cnn_cfg,
     _normalize_embedding_cfg,
+    _normalize_gru_cfg,
     _normalize_mlp_cfg,
     _normalize_network_root,
 )
@@ -51,6 +52,7 @@ __all__ = [
     "_normalize_attention_cfg",
     "_normalize_cnn_cfg",
     "_normalize_embedding_cfg",
+    "_normalize_gru_cfg",
     "_normalize_mlp_cfg",
     "_normalize_network_root",
     # printing

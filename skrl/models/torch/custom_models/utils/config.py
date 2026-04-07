@@ -10,9 +10,10 @@
 
 当前覆盖的配置段包括：
 - 顶层 ``network`` 根配置
-- ``network.cnn``
 - ``network.attention``
+- ``network.cnn``
 - ``network.embedding``
+- ``network.gru``
 - ``network.mlp``
 """
 
@@ -106,7 +107,12 @@ def _get_activation_factory(name: str) -> Callable[[], nn.Module]:
     return mapping[name]
 
 
-def _normalize_network_root(raw_cfg: Any, *, required_keys: set[str], model_name: str) -> dict[str, Any]:
+def _normalize_network_root(
+    raw_cfg: Any,
+    *,
+    required_keys: set[str],
+    model_name: str,
+) -> dict[str, Any]:
     """校验模型级 `network` 配置。
 
     Args:
@@ -222,6 +228,41 @@ def _normalize_attention_cfg(raw_cfg: Any) -> dict[str, int]:
     if embed_dim % num_heads != 0:
         raise ValueError("Invalid `network.attention`: `embed_dim` must be divisible by `num_heads`")
     return {"embed_dim": embed_dim, "num_heads": num_heads}
+
+
+def _normalize_gru_cfg(raw_cfg: Any) -> dict[str, int]:
+    """校验并标准化 GRU 配置。
+
+    Args:
+        raw_cfg: 原始 `network.gru` 配置。
+
+    Returns:
+        标准化后的 GRU 配置，包含 `hidden_size`、`num_layers` 与 `sequence_length`。
+
+    Raises:
+        ValueError: 当缺少必需字段、存在未知字段、类型非法或数值非正时抛出。
+    """
+    # GRU 子配置必须是映射类型
+    if not isinstance(raw_cfg, dict):
+        raise ValueError("Invalid `network.gru` config: expected a mapping")
+
+    # 先校验字段完整性与合法性，再做值校验
+    required_keys = {"hidden_size", "num_layers", "sequence_length"}
+    _check_unknown_keys(raw_cfg, required_keys, "network.gru")
+    missing_keys = sorted(required_keys - set(raw_cfg.keys()))
+    if missing_keys:
+        raise ValueError(f"Missing required `network.gru` keys: {missing_keys}")
+
+    # 读取字段后再做数值约束
+    cfg = {
+        "hidden_size": raw_cfg["hidden_size"],
+        "num_layers": raw_cfg["num_layers"],
+        "sequence_length": raw_cfg["sequence_length"],
+    }
+    for key, value in cfg.items():
+        if not isinstance(value, int) or value <= 0:
+            raise ValueError(f"Invalid `network.gru.{key}`: expected a positive integer, got {value}")
+    return cfg
 
 
 def _normalize_mlp_cfg(raw_cfg: Any) -> dict[str, Any]:

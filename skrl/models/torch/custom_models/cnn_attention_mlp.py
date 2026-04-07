@@ -193,7 +193,7 @@ class CNNAttentionMLPPolicy(GaussianMixin, Model):
             dummy_img = torch.zeros((1, *image_shape))
             cnn_out = self.cnn(dummy_img)
             cnn_out_dim = cnn_out.shape[1]
-        fused_input_dim = cnn_out_dim + embed_dim + embed_dim * self.other_history_length
+        fused_input_dim = cnn_out_dim + ego_input_dim + embed_dim * self.other_history_length
 
         # 4. 定义 Attention 部分 (用于处理 "other_i" 的特征交互)
         # 这里我们使用一个简单的 MultiheadAttention 来处理 "other_i" 特征之间的关系
@@ -369,7 +369,7 @@ class CNNAttentionMLPPolicy(GaussianMixin, Model):
         attention_output = attention_output.squeeze(1).reshape(batch_size, other_history_length, -1).reshape(batch_size, -1)
 
         # 7. 融合图像特征与交互特征后输入 MLP
-        combined = torch.cat([img_features, ego_embedded, attention_output], dim=1)  # (batch_size, (cnn_out_dim + embed_dim + embed_dim * history_length))
+        combined = torch.cat([img_features, ego, attention_output], dim=1)  # (batch_size, (cnn_out_dim + ego_input_dim + embed_dim * history_length))
 
         # 8. 通过 MLP 计算 action 均值
         output = self.mlp(combined)
@@ -456,7 +456,7 @@ class CNNAttentionMLPValue(DeterministicMixin, Model):
             dummy_img = torch.zeros((1, *image_shape))
             cnn_out = self.cnn(dummy_img)
             cnn_out_dim = cnn_out.shape[1]
-        fused_input_dim = cnn_out_dim + embed_dim + embed_dim * self.other_history_length
+        fused_input_dim = cnn_out_dim + ego_input_dim + embed_dim * self.other_history_length
 
         # 4. 定义 Attention 部分 (用于处理 "other_i" 的特征交互)
         # 这里我们使用一个简单的 MultiheadAttention 来处理 "other_i" 特征之间的关系
@@ -616,7 +616,7 @@ class CNNAttentionMLPValue(DeterministicMixin, Model):
         attention_output = attention_output.squeeze(1).reshape(batch_size, other_history_length, -1).reshape(batch_size, -1)
 
         # 7. 融合图像特征与交互特征后输入 MLP
-        combined = torch.cat([img_features, ego_embedded, attention_output], dim=1)  # (batch_size, (cnn_out_dim + embed_dim + embed_dim * history_length))
+        combined = torch.cat([img_features, ego, attention_output], dim=1)  # (batch_size, (cnn_out_dim + ego_input_dim + embed_dim * history_length))
 
         # 8. 通过 MLP 计算 value
         output = self.mlp(combined)
