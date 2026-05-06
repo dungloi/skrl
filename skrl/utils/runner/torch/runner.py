@@ -12,7 +12,7 @@ from skrl.agents.torch import Agent
 from skrl.envs.wrappers.torch import MultiAgentEnvWrapper, Wrapper
 from skrl.models.torch import Model
 from skrl.resources.noises.torch import GaussianNoise, OrnsteinUhlenbeckNoise  # noqa
-from skrl.resources.preprocessors.torch import RunningStandardScaler  # noqa
+from skrl.resources.preprocessors.torch import RunningStandardScaler, SelectiveRunningStandardScaler  # noqa
 from skrl.resources.schedulers.torch import KLAdaptiveLR  # noqa
 from skrl.trainers.torch import Trainer
 from skrl.utils import set_seed
