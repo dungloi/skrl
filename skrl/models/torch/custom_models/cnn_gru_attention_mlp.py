@@ -82,6 +82,43 @@ def _merge_done_flags(inputs: dict[str, Any]) -> torch.Tensor | None:
     return terminated | truncated
 
 
+def _extract_attention_key_padding_mask(
+    data: dict[str, torch.Tensor],
+    *,
+    num_other: int,
+    other_history_length: int,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """提取 attention 的 key_padding_mask；当前环境约定 `others_mask=True` 表示 valid。"""
+    visible_mask = data.get("others_mask")
+    if visible_mask is None:
+        return None, None
+
+    if visible_mask.dim() == 2:
+        if visible_mask.shape[1] != num_other:
+            raise ValueError(
+                f"Invalid `others_mask` shape: expected (batch_size, {num_other}), "
+                f"got {tuple(visible_mask.shape)}"
+            )
+        visible_mask = visible_mask.unsqueeze(2).expand(-1, -1, other_history_length)
+    elif visible_mask.dim() == 3:
+        if visible_mask.shape[1] != num_other or visible_mask.shape[2] != other_history_length:
+            raise ValueError(
+                "Invalid `others_mask` shape: expected "
+                f"(batch_size, {num_other}, {other_history_length}), got {tuple(visible_mask.shape)}"
+            )
+    else:
+        raise ValueError(
+            "Invalid `others_mask` shape: expected "
+            f"(batch_size, {num_other}) or (batch_size, {num_other}, {other_history_length}), "
+            f"got {tuple(visible_mask.shape)}"
+        )
+
+    key_padding_mask = ~(visible_mask > 0.5)
+    key_padding_mask = key_padding_mask.permute(0, 2, 1).reshape(-1, num_other)
+    all_masked = key_padding_mask.all(dim=1)
+    return key_padding_mask, all_masked
+
+
 class _CNNGRUAttentionMLPCommon:
     """共享 CNN-attention-GRU 主干逻辑。"""
 
@@ -99,7 +136,12 @@ class _CNNGRUAttentionMLPCommon:
         # ----------------------------------------
         # 1. 解析输入空间维度（input_space 是一个 Dict，包含 "image"、"ego" 和 "other_i"）
         # 解析 "other_i" 的数量和 shape，假设它们都是同样的 shape
-        self.other_keys = sorted([key for key in input_space.keys() if key.startswith("other_")])
+        self.other_keys = sorted(
+            [key for key in input_space.keys() if key.startswith("other_")],
+            key=lambda k: int(k.split("_")[-1]),
+        )
+        if not self.other_keys:
+            raise ValueError("No `other_*` keys found in input_space")
         other_shape = input_space[self.other_keys[0]].shape
         self.other_history_length, other_input_dim = _parse_other_shape(other_shape)
 
@@ -141,9 +183,9 @@ class _CNNGRUAttentionMLPCommon:
             cnn_out = self.cnn(dummy_img)
             cnn_out_dim = cnn_out.shape[1]
 
-        # 4. 定义图像分支 GRU（用于处理跨时间步的图像记忆）
-        self.image_gru = nn.GRU(
-            input_size=cnn_out_dim,
+        # 4. 定义 GRU（用于处理融合后的跨时间步记忆）
+        self.gru = nn.GRU(
+            input_size=self.hidden_size,
             hidden_size=self.hidden_size,
             num_layers=self.num_layers,
             batch_first=True,
@@ -158,7 +200,12 @@ class _CNNGRUAttentionMLPCommon:
         )
 
         # 6. 定义 "ego", "other" 的特征映射层
-        self.ego_embedding = nn.Sequential(
+        self.ego_query_embedding = nn.Sequential(
+            nn.Linear(ego_input_dim, embed_dim),
+            nn.LayerNorm(embed_dim),
+            nn.ReLU(),
+        )
+        self.ego_fusion_embedding = nn.Sequential(
             nn.Linear(ego_input_dim, embed_dim),
             nn.LayerNorm(embed_dim),
             nn.ReLU(),
@@ -169,8 +216,14 @@ class _CNNGRUAttentionMLPCommon:
             nn.ReLU(),
         )
 
-        # 7. 定义 MLP 部分 (融合特征 -> Action / Value)
-        fused_input_dim = self.hidden_size + ego_input_dim + embed_dim * self.other_history_length
+        # 7. 定义单步多模态融合层与 MLP 部分 (融合特征 -> GRU -> Action / Value)
+        fusion_raw_dim = cnn_out_dim + embed_dim + embed_dim * self.other_history_length
+        self.fusion_layer = nn.Sequential(
+            nn.Linear(fusion_raw_dim, self.hidden_size),
+            nn.LayerNorm(self.hidden_size),
+            nn.ReLU(),
+        )
+        fused_input_dim = self.hidden_size
         self.mlp = _build_mlp(
             input_dim=fused_input_dim,
             hidden_dims=mlp_cfg["hidden_dims"],
@@ -187,6 +240,7 @@ class _CNNGRUAttentionMLPCommon:
         self._mlp_cfg = mlp_cfg
         self._gru_cfg = gru_cfg
         self._cnn_out_dim = cnn_out_dim
+        self._fusion_raw_dim = fusion_raw_dim
         self._fused_input_dim = fused_input_dim
 
     def get_specification(self) -> dict[str, Any]:
@@ -198,35 +252,35 @@ class _CNNGRUAttentionMLPCommon:
             }
         }
 
-    def _run_image_gru(
-        self, img_features: torch.Tensor, inputs: dict[str, Any]
+    def _run_gru(
+        self, step_features: torch.Tensor, inputs: dict[str, Any]
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """执行图像分支 GRU 前向，并按 skrl recurrent 接口处理 hidden state。"""
+        """执行融合特征 GRU 前向，并按 skrl recurrent 接口处理 hidden state。"""
         # 1. 读取输入中的 recurrent state；若没有则使用全零初始状态
         rnn_states = inputs.get("rnn")
         if not rnn_states:
             zero_hidden = torch.zeros(
                 self.num_layers,
-                img_features.shape[0],
+                step_features.shape[0],
                 self.hidden_size,
-                device=img_features.device,
-                dtype=img_features.dtype,
+                device=step_features.device,
+                dtype=step_features.dtype,
             )
-            rnn_output, _ = self.image_gru(img_features.unsqueeze(1), zero_hidden)
+            rnn_output, _ = self.gru(step_features.unsqueeze(1), zero_hidden)
             return rnn_output.squeeze(1), None
 
         # 2. rollout 与 training 的 hidden state 组织方式不同，分别处理
         hidden_states = rnn_states[0]
         if self.training:
             # training 阶段要求 batch 能够按 sequence_length 还原成序列
-            if img_features.shape[0] % self.sequence_length != 0:
+            if step_features.shape[0] % self.sequence_length != 0:
                 raise ValueError(
                     "Invalid recurrent batch size: expected number of samples to be divisible by "
-                    f"`sequence_length={self.sequence_length}`, got {img_features.shape[0]}"
+                    f"`sequence_length={self.sequence_length}`, got {step_features.shape[0]}"
                 )
 
             # 将平铺 batch 还原成 (batch_size, sequence_length, feature_dim)
-            rnn_input = img_features.view(-1, self.sequence_length, img_features.shape[-1])
+            rnn_input = step_features.view(-1, self.sequence_length, step_features.shape[-1])
             hidden_states = hidden_states.view(
                 self.num_layers, -1, self.sequence_length, hidden_states.shape[-1]
             )
@@ -246,18 +300,18 @@ class _CNNGRUAttentionMLPCommon:
 
                 for i in range(len(indexes) - 1):
                     i0, i1 = indexes[i], indexes[i + 1]
-                    rnn_output, hidden_states = self.image_gru(rnn_input[:, i0:i1, :], hidden_states)
+                    rnn_output, hidden_states = self.gru(rnn_input[:, i0:i1, :], hidden_states)
                     hidden_states[:, done[:, i1 - 1], :] = 0
                     rnn_outputs.append(rnn_output)
 
                 rnn_output = torch.cat(rnn_outputs, dim=1)
             # 若序列中没有 done，则可以直接整段运行 GRU
             else:
-                rnn_output, hidden_states = self.image_gru(rnn_input, hidden_states)
+                rnn_output, hidden_states = self.gru(rnn_input, hidden_states)
         # rollout 阶段每次只处理一个时间步，因此 sequence_length = 1
         else:
-            rnn_input = img_features.view(-1, 1, img_features.shape[-1])
-            rnn_output, hidden_states = self.image_gru(rnn_input, hidden_states)
+            rnn_input = step_features.view(-1, 1, step_features.shape[-1])
+            rnn_output, hidden_states = self.gru(rnn_input, hidden_states)
 
         # 3. 将 GRU 输出重新展平成后续 MLP 需要的二维 batch
         rnn_output = torch.flatten(rnn_output, start_dim=0, end_dim=1)
@@ -293,12 +347,12 @@ class _CNNGRUAttentionMLPCommon:
                 f"{self.other_history_length}, got {other_history_length}"
             )
 
-        # 3. CNN + GRU 处理图像输入
+        # 3. CNN 处理图像输入
         img_features = self.cnn(img)
-        img_features, hidden_states = self._run_image_gru(img_features, inputs)
 
         # 4. 计算 "ego" 与 "other" 的 embedding
-        ego_embedded = self.ego_embedding(ego)
+        ego_query = self.ego_query_embedding(ego)
+        ego_fusion = self.ego_fusion_embedding(ego)
         other_embedded = self.other_embedding(
             other.reshape(batch_size * num_other * other_history_length, other_dim)
         ).reshape(batch_size, num_other, other_history_length, -1)
@@ -307,20 +361,42 @@ class _CNNGRUAttentionMLPCommon:
         other_key_value = other_embedded.permute(0, 2, 1, 3).reshape(
             batch_size * other_history_length, num_other, -1
         )
-        attention_output, _ = self.attention(
-            query=ego_embedded.unsqueeze(1)
-            .expand(-1, other_history_length, -1)
-            .reshape(batch_size * other_history_length, 1, -1),
-            key=other_key_value,
-            value=other_key_value,
+        query = ego_query.unsqueeze(1).expand(-1, other_history_length, -1).reshape(
+            batch_size * other_history_length, 1, -1
         )
+        key_padding_mask, all_masked = _extract_attention_key_padding_mask(
+            data,
+            num_other=num_other,
+            other_history_length=other_history_length,
+        )
+        if key_padding_mask is None:
+            attention_output, _ = self.attention(query=query, key=other_key_value, value=other_key_value)
+        else:
+            attention_output = torch.zeros(
+                batch_size * other_history_length,
+                1,
+                query.shape[-1],
+                device=query.device,
+                dtype=query.dtype,
+            )
+            valid_rows = ~all_masked
+            if torch.any(valid_rows):
+                valid_attention_output, _ = self.attention(
+                    query=query[valid_rows],
+                    key=other_key_value[valid_rows],
+                    value=other_key_value[valid_rows],
+                    key_padding_mask=key_padding_mask[valid_rows],
+                )
+                attention_output[valid_rows] = valid_attention_output
         attention_output = attention_output.squeeze(1).reshape(batch_size, other_history_length, -1).reshape(
             batch_size, -1
         )
 
-        # 6. 融合图像特征与交互特征后输入 MLP
-        combined = torch.cat([img_features, ego, attention_output], dim=1)
-        return self.mlp(combined), hidden_states
+        # 6. 先融合单步多模态特征，再经 GRU 和 MLP 输出
+        fused_step_feature = torch.cat([img_features, ego_fusion, attention_output], dim=1)
+        fused_step_feature = self.fusion_layer(fused_step_feature)
+        recurrent_feature, hidden_states = self._run_gru(fused_step_feature, inputs)
+        return self.mlp(recurrent_feature), hidden_states
 
 
 class CNNGRUAttentionMLPPolicy(_CNNGRUAttentionMLPCommon, GaussianMixin, Model):
@@ -475,6 +551,7 @@ class CNNGRUAttentionMLPPolicy(_CNNGRUAttentionMLPCommon, GaussianMixin, Model):
 
         _print_section("Derived Dims")
         _print_kv("cnn_out_dim", self._cnn_out_dim)
+        _print_kv("fusion_raw_dim", self._fusion_raw_dim)
         _print_kv("gru_hidden_size", self.hidden_size)
         _print_kv("fused_input_dim", self._fused_input_dim)
         _print_block_footer(f"[{self.__class__.__name__}] Ready")
@@ -617,6 +694,7 @@ class CNNGRUAttentionMLPValue(_CNNGRUAttentionMLPCommon, DeterministicMixin, Mod
 
         _print_section("Derived Dims")
         _print_kv("cnn_out_dim", self._cnn_out_dim)
+        _print_kv("fusion_raw_dim", self._fusion_raw_dim)
         _print_kv("gru_hidden_size", self.hidden_size)
         _print_kv("fused_input_dim", self._fused_input_dim)
         _print_kv("output_dim", 1)
