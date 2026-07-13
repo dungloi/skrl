@@ -112,6 +112,36 @@ class SelectiveRunningStandardScaler(nn.Module):
                 input_count,
             )
 
+    def update_stats_distributed(self, x: torch.Tensor | None) -> None:
+        """Update selected columns from global moments on all distributed workers."""
+        if x is None or self._selected_size == 0:
+            return
+        if not config.torch.is_distributed:
+            self.update_stats(x)
+            return
+        with torch.no_grad():
+            selected = self._gather_selected(x).to(dtype=torch.float64)
+            reduce_dims = tuple(range(selected.dim() - 1))
+            input_count = 1
+            for dimension in selected.shape[:-1]:
+                input_count *= int(dimension)
+            local_sum = selected.sum(dim=reduce_dims)
+            local_sumsq = selected.square().sum(dim=reduce_dims)
+            moments = torch.cat(
+                (
+                    torch.tensor([float(input_count)], dtype=torch.float64, device=selected.device),
+                    local_sum.reshape(-1),
+                    local_sumsq.reshape(-1),
+                )
+            )
+            torch.distributed.all_reduce(moments, op=torch.distributed.ReduceOp.SUM)
+            global_count = int(moments[0].item())
+            input_mean = moments[1 : 1 + self._selected_size] / global_count
+            input_var = (
+                moments[1 + self._selected_size :] / global_count - input_mean.square()
+            ).clamp_min(0)
+            self._parallel_variance(input_mean, input_var, global_count)
+
     def _compute(self, x: torch.Tensor, *, train: bool = False, inverse: bool = False) -> torch.Tensor:
         if self._selected_size == 0:
             return x

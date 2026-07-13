@@ -69,6 +69,9 @@ class ManiSkillWrapper(Wrapper):
             if dones.any():
                 env_idx = torch.arange(self.num_envs, device=dones.device)[dones]
                 observations, self._info = self._env.reset(options={"env_idx": env_idx})
+                if isinstance(self._info, dict):
+                    self._info = dict(self._info)
+                    self._info["_skrl_autoreset"] = True
 
         self._observations = flatten_tensorized_space(tensorize_space(self.observation_space, observations))
         return self._observations, reward.view(-1, 1), terminated.view(-1, 1), truncated.view(-1, 1), self._info

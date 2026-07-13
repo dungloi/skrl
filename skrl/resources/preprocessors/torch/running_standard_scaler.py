@@ -83,6 +83,35 @@ class RunningStandardScaler(nn.Module):
             else:
                 self._parallel_variance(torch.mean(x, dim=0), torch.var(x, dim=0, unbiased=False), x.shape[0])
 
+    def update_stats_distributed(self, x: torch.Tensor | None) -> None:
+        """Update from global moments so every distributed worker keeps identical statistics."""
+        if x is None:
+            return
+        if not config.torch.is_distributed:
+            self.update_stats(x)
+            return
+        with torch.no_grad():
+            reduce_dims = tuple(range(x.dim() - 1))
+            input_count = 1
+            for dimension in x.shape[:-1]:
+                input_count *= int(dimension)
+            x64 = x.to(dtype=torch.float64)
+            local_sum = x64.sum(dim=reduce_dims)
+            local_sumsq = x64.square().sum(dim=reduce_dims)
+            moments = torch.cat(
+                (
+                    torch.tensor([float(input_count)], dtype=torch.float64, device=x.device),
+                    local_sum.reshape(-1),
+                    local_sumsq.reshape(-1),
+                )
+            )
+            torch.distributed.all_reduce(moments, op=torch.distributed.ReduceOp.SUM)
+            global_count = int(moments[0].item())
+            width = self.running_mean.numel()
+            input_mean = moments[1 : 1 + width] / global_count
+            input_var = (moments[1 + width :] / global_count - input_mean.square()).clamp_min(0)
+            self._parallel_variance(input_mean, input_var, global_count)
+
     def _compute(self, x: torch.Tensor, *, train: bool = False, inverse: bool = False) -> torch.Tensor:
         """Compute the standardization of the input data.
 

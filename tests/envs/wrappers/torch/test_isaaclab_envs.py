@@ -187,6 +187,8 @@ def test_env(capsys: pytest.CaptureFixture, num_states: int):
             assert isinstance(terminated, torch.Tensor) and terminated.shape == torch.Size([num_envs, 1])
             assert isinstance(truncated, torch.Tensor) and truncated.shape == torch.Size([num_envs, 1])
             assert isinstance(info, Mapping)
+            assert info["_skrl_autoreset"] is True
+            assert "_skrl_autoreset" not in original_env.extras
             if num_states:
                 assert isinstance(state, torch.Tensor) and state.shape == torch.Size([num_envs, num_states])
             else:

@@ -106,12 +106,21 @@ class PlaygroundWrapper(Wrapper):
                 tensorize_space(self.state_space, _jax2torch(self._env_state.obs["privileged_state"], self.device))
             )
         reward = _jax2torch(self._env_state.reward, self.device)
-        terminated = _jax2torch(self._env_state.done, self.device)
+        # Brax's EpisodeWrapper exposes an aggregate ``done`` flag and a separate
+        # time-limit marker. Convert them to Gymnasium's mutually-exclusive
+        # terminated/truncated semantics before PPO applies timeout handling.
+        done = _jax2torch(self._env_state.done, self.device).bool()
         truncated = self._env_state.info.get("truncation")
         if truncated is None:
-            truncated = jnp.zeros_like(terminated)
-        truncated = _jax2torch(truncated, self.device)
+            truncated = jnp.zeros_like(self._env_state.done)
+        truncated = _jax2torch(truncated, self.device).bool()
+        terminated = done & ~truncated
         info = self._env_state.info
+        if isinstance(info, dict):
+            info = dict(info)
+            # The standard Playground loader applies Brax's auto-reset wrapper, so
+            # completed environments expose reset observations/states here.
+            info["_skrl_autoreset"] = True
 
         return self._observations, reward.reshape(-1, 1), terminated.reshape(-1, 1), truncated.reshape(-1, 1), info
 

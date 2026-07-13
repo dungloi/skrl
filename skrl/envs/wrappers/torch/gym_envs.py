@@ -103,6 +103,9 @@ class GymWrapper(Wrapper):
 
         # save observation and info for vectorized envs
         if self._vectorized:
+            if isinstance(info, dict):
+                info = dict(info)
+                info["_skrl_autoreset"] = True
             self._observation = observation
             self._info = info
 

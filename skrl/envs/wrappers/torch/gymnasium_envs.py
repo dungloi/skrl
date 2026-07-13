@@ -35,6 +35,21 @@ class GymnasiumWrapper(Wrapper):
         except Exception as e:
             logger.warning(f"Failed to check for a vectorized environment: {e}")
         if self._vectorized:
+            # skrl trainers expect the observation returned with a done transition to be
+            # ready for the next action. Gymnasium's NEXT_STEP mode instead emits a
+            # synthetic reset step on the following call, which would be recorded as an
+            # ordinary PPO transition. Reject that mode rather than silently mixing it
+            # into the rollout.
+            autoreset_mode = getattr(env, "autoreset_mode", None)
+            if autoreset_mode is not None:
+                try:
+                    same_step_mode = gymnasium.vector.AutoresetMode.SAME_STEP
+                except AttributeError:
+                    same_step_mode = None
+                if same_step_mode is not None and autoreset_mode != same_step_mode:
+                    raise ValueError(
+                        "Gymnasium vector environments must use AutoresetMode.SAME_STEP with skrl"
+                    )
             self._reset_once = True
             self._observation = None
             self._info = None
@@ -78,6 +93,12 @@ class GymnasiumWrapper(Wrapper):
 
         # save observation and info for vectorized envs
         if self._vectorized:
+            if isinstance(info, dict):
+                info = dict(info)
+                # SAME_STEP returns reset observations for completed environments. PPO
+                # timeout bootstrap must therefore use an explicitly preserved final state
+                # or fail fast instead of evaluating this observation.
+                info["_skrl_autoreset"] = True
             self._observation = observation
             self._info = info
 

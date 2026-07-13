@@ -105,6 +105,7 @@ def test_vectorized_env(capsys: pytest.CaptureFixture, vectorization_mode: str):
             assert isinstance(terminated, torch.Tensor) and terminated.shape == torch.Size([num_envs, 1])
             assert isinstance(truncated, torch.Tensor) and truncated.shape == torch.Size([num_envs, 1])
             assert isinstance(info, Mapping)
+            assert info["_skrl_autoreset"] is True
             assert state is None
 
     try:

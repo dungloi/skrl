@@ -11,6 +11,44 @@ from skrl.envs.wrappers.torch.mani_skill_envs import ManiSkillWrapper
 from ....utilities import is_running_on_github_actions
 
 
+class _SyntheticAutoResetManiSkillEnv:
+    def __init__(self):
+        self.unwrapped = self
+        self.device = "cpu"
+        self.num_envs = 2
+        self.single_observation_space = gymnasium.spaces.Box(-100, 100, shape=(2,))
+        self.single_action_space = gymnasium.spaces.Box(-1, 1, shape=(1,))
+
+    def step(self, actions):
+        assert actions.shape == (2, 1)
+        return (
+            torch.full((2, 2), 7.0),
+            torch.zeros(2),
+            torch.tensor([False, False]),
+            torch.tensor([True, False]),
+            {"phase": "terminal"},
+        )
+
+    def reset(self, seed=None, options=None):
+        assert options is None or options["env_idx"].tolist() == [0]
+        return torch.full((2, 2), -3.0), {"phase": "reset"}
+
+    def render(self, *args, **kwargs):
+        return None
+
+    def close(self):
+        return None
+
+
+def test_synthetic_done_step_marks_the_overwritten_observation_as_autoreset():
+    env = ManiSkillWrapper(_SyntheticAutoResetManiSkillEnv())
+    observation, _, _, truncated, info = env.step(torch.zeros((2, 1)))
+    assert truncated.tolist() == [[True], [False]]
+    torch.testing.assert_close(observation, torch.full((2, 2), -3.0), rtol=0, atol=0)
+    assert info["phase"] == "reset"
+    assert info["_skrl_autoreset"] is True
+
+
 def test_env(capsys: pytest.CaptureFixture):
     num_envs = 10
     action = torch.ones((num_envs, 8))

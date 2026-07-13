@@ -63,6 +63,11 @@ class IsaacLabWrapper(Wrapper):
         actions = unflatten_tensorized_space(self.action_space, actions)
         with torch.no_grad():
             observations, reward, terminated, truncated, self._info = self._env.step(actions)
+        if isinstance(self._info, dict):
+            # Isaac Lab computes returned observations after automatically resetting done
+            # environments, so they cannot be used as terminal states for timeout bootstrap.
+            self._info = dict(self._info)
+            self._info["_skrl_autoreset"] = True
         self._observations = flatten_tensorized_space(tensorize_space(self.observation_space, observations["policy"]))
         states = observations.get("critic", None)
         if states is not None:

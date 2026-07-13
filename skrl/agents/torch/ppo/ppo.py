@@ -18,6 +18,14 @@ from skrl.resources.schedulers.torch import KLAdaptiveLR
 from skrl.utils import ScopedTimer
 
 from .ppo_cfg import PPO_CFG
+from ._utils import (
+    any_rank_true,
+    ensure_full_rollout,
+    require_finite,
+    require_finite_model,
+    validate_ppo_setup,
+    validate_scalar_output,
+)
 
 
 def compute_gae(
@@ -26,6 +34,7 @@ def compute_gae(
     terminated: torch.Tensor,
     values: torch.Tensor,
     next_values: torch.Tensor,
+    truncated: torch.Tensor | None = None,
     discount_factor: float = 0.99,
     lambda_coefficient: float = 0.95,
 ) -> torch.Tensor:
@@ -33,6 +42,7 @@ def compute_gae(
 
     :param rewards: Rewards obtained by the agent.
     :param terminated: Signals to indicate that episodes have ended.
+    :param truncated: Signals to indicate that episodes have ended because of a time limit.
     :param values: Values obtained by the agent.
     :param next_values: Next values obtained by the agent.
     :param discount_factor: Discount factor.
@@ -42,7 +52,12 @@ def compute_gae(
     """
     advantage = 0
     advantages = torch.zeros_like(rewards)
-    not_terminated = terminated.logical_not()
+    # Both termination kinds are episode boundaries for the lambda trace. If time-limit
+    # bootstrapping is enabled, the caller adds gamma * V(final_observation) to the timeout
+    # reward before entering this function; the trace must still not cross into the reset
+    # episode that follows it.
+    done = terminated if truncated is None else terminated | truncated
+    not_done = done.logical_not().to(dtype=rewards.dtype)
     memory_size = rewards.shape[0]
 
     # advantages computation
@@ -51,7 +66,7 @@ def compute_gae(
         advantage = (
             rewards[i]
             - values[i]
-            + discount_factor * not_terminated[i] * (next_values + lambda_coefficient * advantage)
+            + discount_factor * not_done[i] * (next_values + lambda_coefficient * advantage)
         )
         advantages[i] = advantage
     # returns computation
@@ -102,6 +117,9 @@ class PPO(Agent):
         # models
         self.policy = self.models.get("policy", None)
         self.value = self.models.get("value", None)
+        validate_ppo_setup(
+            name="PPO", cfg=self.cfg, policy=self.policy, value=self.value, memory=self.memory
+        )
 
         # checkpoint models
         self.checkpoint_modules["policy"] = self.policy
@@ -121,6 +139,7 @@ class PPO(Agent):
             self.scaler = torch.amp.GradScaler(device=self._device_type, enabled=self.cfg.mixed_precision)
         else:
             self.scaler = torch.cuda.amp.GradScaler(enabled=self.cfg.mixed_precision)
+        self.checkpoint_modules["grad_scaler"] = self.scaler
 
         # set up optimizer and learning rate scheduler
         if self.policy is not None and self.value is not None:
@@ -138,7 +157,10 @@ class PPO(Agent):
                 self.optimizer = optimizer_cls(self.policy.parameters(), lr=self.cfg.learning_rate[0], **optimizer_kwargs)
             else:
                 self.optimizer = optimizer_cls(
-                    itertools.chain(self.policy.parameters(), self.value.parameters()),
+                    [
+                        {"params": self.policy.parameters(), "lr": self.cfg.learning_rate[0]},
+                        {"params": self.value.parameters(), "lr": self.cfg.learning_rate[1]},
+                    ],
                     lr=self.cfg.learning_rate[0],
                     **optimizer_kwargs,
                 )
@@ -149,6 +171,7 @@ class PPO(Agent):
                 self.scheduler = self.cfg.learning_rate_scheduler[0](
                     self.optimizer, **self.cfg.learning_rate_scheduler_kwargs[0]
                 )
+                self.checkpoint_modules["scheduler"] = self.scheduler
 
         # set up preprocessors
         # - observations
@@ -187,6 +210,7 @@ class PPO(Agent):
             self.memory.create_tensor(name="actions", size=self.action_space, dtype=torch.float32)
             self.memory.create_tensor(name="rewards", size=1, dtype=torch.float32)
             self.memory.create_tensor(name="terminated", size=1, dtype=torch.bool)
+            self.memory.create_tensor(name="truncated", size=1, dtype=torch.bool)
             self.memory.create_tensor(name="log_prob", size=1, dtype=torch.float32)
             self.memory.create_tensor(name="values", size=1, dtype=torch.float32)
             self.memory.create_tensor(name="returns", size=1, dtype=torch.float32)
@@ -198,7 +222,9 @@ class PPO(Agent):
         self._current_next_observations = None
         self._current_next_states = None
         self._current_log_prob = None
+        self._current_is_random = False
         self._rollout = 0
+        self._rollout_consumed = False
 
     def act(
         self, observations: torch.Tensor, states: torch.Tensor | None, *, timestep: int, timesteps: int
@@ -217,15 +243,29 @@ class PPO(Agent):
             "observations": self._observation_preprocessor(observations),
             "states": self._state_preprocessor(states),
         }
+        self._current_is_random = timestep < self.cfg.random_timesteps
         # sample random actions
         # TODO, check for stochasticity
-        if timestep < self.cfg.random_timesteps:
-            return self.policy.random_act(inputs, role="policy")
+        if self._current_is_random:
+            actions, outputs = self.policy.random_act(inputs, role="policy")
+            if "log_prob" not in outputs:
+                _, likelihood_outputs = self.policy.act(
+                    {**inputs, "taken_actions": actions}, role="policy"
+                )
+                outputs = {**likelihood_outputs, **outputs, "log_prob": likelihood_outputs["log_prob"]}
+            self._current_log_prob = outputs["log_prob"]
+            validate_scalar_output(
+                "PPO policy log_prob", self._current_log_prob, observations.shape[0], synchronize=True
+            )
+            return actions, outputs
 
         # sample stochastic actions
         with torch.autocast(device_type=self._device_type, enabled=self.cfg.mixed_precision):
             actions, outputs = self.policy.act(inputs, role="policy")
             self._current_log_prob = outputs["log_prob"]
+            validate_scalar_output(
+                "PPO policy log_prob", self._current_log_prob, observations.shape[0], synchronize=True
+            )
 
         return actions, outputs
 
@@ -272,6 +312,11 @@ class PPO(Agent):
             timesteps=timesteps,
         )
 
+        # PPO is on-policy. Random warm-up transitions may move the environment to a
+        # representative state distribution, but they must not enter the PPO rollout.
+        if self._current_is_random:
+            return
+
         if self.memory is not None:
             self._current_next_observations = next_observations
             self._current_next_states = next_states
@@ -287,11 +332,36 @@ class PPO(Agent):
                     "states": self._state_preprocessor(states),
                 }
                 values, _ = self.value.act(inputs, role="value")
+                validate_scalar_output("PPO value", values, observations.shape[0], synchronize=True)
                 values = self._value_preprocessor(values, inverse=True)
 
             # time-limit (truncation) bootstrapping
-            if self.cfg.time_limit_bootstrap:
-                rewards += self.cfg.discount_factor * values * truncated
+            timeout_mask = truncated & ~terminated
+            if self.cfg.time_limit_bootstrap and any_rank_true(timeout_mask):
+                reset_timeout = (
+                    timeout_mask.any()
+                    if isinstance(infos, dict) and infos.get("_skrl_autoreset", False)
+                    else torch.zeros((), dtype=torch.bool, device=timeout_mask.device)
+                )
+                if any_rank_true(reset_timeout):
+                    raise RuntimeError(
+                        "PPO time-limit bootstrapping requires final pre-reset observations/states, "
+                        "but this auto-reset environment only returned reset observations"
+                    )
+                # ``next_observations`` / ``next_states`` must describe the final state before
+                # reset for truncated environments. Auto-reset integrations must preserve that
+                # state in their wrapper rather than passing the reset observation here.
+                with torch.autocast(device_type=self._device_type, enabled=self.cfg.mixed_precision):
+                    next_inputs = {
+                        "observations": self._observation_preprocessor(next_observations),
+                        "states": self._state_preprocessor(next_states),
+                    }
+                    timeout_values, _ = self.value.act(next_inputs, role="value")
+                    validate_scalar_output(
+                        "PPO timeout value", timeout_values, observations.shape[0], synchronize=True
+                    )
+                    timeout_values = self._value_preprocessor(timeout_values, inverse=True)
+                rewards = rewards + self.cfg.discount_factor * timeout_values * timeout_mask
 
             # storage transition in memory
             self.memory.add_samples(
@@ -300,9 +370,11 @@ class PPO(Agent):
                 actions=actions,
                 rewards=rewards,
                 terminated=terminated,
+                truncated=truncated,
                 log_prob=self._current_log_prob,
                 values=values,
             )
+            self._rollout_consumed = False
 
     def pre_interaction(self, *, timestep: int, timesteps: int) -> None:
         """Method called before the interaction with the environment.
@@ -310,7 +382,18 @@ class PPO(Agent):
         :param timestep: Current timestep.
         :param timesteps: Number of timesteps.
         """
-        pass
+        if timestep == 0:
+            # A new trainer run starts from a newly reset environment. Discard a partial
+            # rollout left by a previous run so data from two unrelated episodes can never
+            # share one PPO update.
+            if self.memory is not None:
+                self.memory.reset()
+            self._rollout = 0
+            self._current_next_observations = None
+            self._current_next_states = None
+            self._current_log_prob = None
+            self._current_is_random = False
+            self._rollout_consumed = False
 
     def post_interaction(self, *, timestep: int, timesteps: int) -> None:
         """Method called after the interaction with the environment.
@@ -318,6 +401,9 @@ class PPO(Agent):
         :param timestep: Current timestep.
         :param timesteps: Number of timesteps.
         """
+        if self._current_is_random:
+            super().post_interaction(timestep=timestep, timesteps=timesteps)
+            return
         self._rollout += 1
         if not self._rollout % self.cfg.rollouts and timestep >= self.cfg.learning_starts:
             with ScopedTimer() as timer:
@@ -335,6 +421,23 @@ class PPO(Agent):
         :param timestep: Current timestep.
         :param timesteps: Number of timesteps.
         """
+        ensure_full_rollout(name="PPO", memory=self.memory, consumed=self._rollout_consumed)
+        require_finite_model("PPO policy", self.policy, synchronize=True)
+        if self.value is not self.policy:
+            require_finite_model("PPO value", self.value, synchronize=True)
+        require_finite(
+            "PPO rollout observations", self.memory.get_tensor_by_name("observations"), synchronize=True
+        )
+        require_finite("PPO rollout actions", self.memory.get_tensor_by_name("actions"), synchronize=True)
+        if "states" in self.memory.tensors:
+            require_finite("PPO rollout states", self.memory.get_tensor_by_name("states"), synchronize=True)
+        require_finite("PPO rollout rewards", self.memory.get_tensor_by_name("rewards"), synchronize=True)
+        require_finite("PPO rollout log_prob", self.memory.get_tensor_by_name("log_prob"), synchronize=True)
+        require_finite("PPO rollout values", self.memory.get_tensor_by_name("values"), synchronize=True)
+        require_finite("PPO next observations", self._current_next_observations, synchronize=True)
+        if self._current_next_states is not None:
+            require_finite("PPO next states", self._current_next_states, synchronize=True)
+
         # compute returns and advantages
         with torch.no_grad(), torch.autocast(device_type=self._device_type, enabled=self.cfg.mixed_precision):
             inputs = {
@@ -344,32 +447,45 @@ class PPO(Agent):
             self.value.enable_training_mode(False)
             last_values, _ = self.value.act(inputs, role="value")
             self.value.enable_training_mode(True)
+            validate_scalar_output(
+                "PPO last value", last_values, self._current_next_observations.shape[0], synchronize=True
+            )
             last_values = self._value_preprocessor(last_values, inverse=True)
 
         values = self.memory.get_tensor_by_name("values")
         returns, advantages = compute_gae(
             rewards=self.memory.get_tensor_by_name("rewards"),
             terminated=self.memory.get_tensor_by_name("terminated"),
+            truncated=self.memory.get_tensor_by_name("truncated"),
             values=values,
             next_values=last_values,
             discount_factor=self.cfg.discount_factor,
             lambda_coefficient=self.cfg.lambda_,
         )
+        require_finite("PPO returns", returns, synchronize=True)
+        require_finite("PPO advantages", advantages, synchronize=True)
 
-        self.memory.set_tensor_by_name("values", self._value_preprocessor(values, train=True))
-        self.memory.set_tensor_by_name("returns", self._value_preprocessor(returns, train=True))
+        # Keep value normalization in one frozen coordinate system for the complete PPO
+        # update. In particular, old values, current predictions and return targets must be
+        # comparable for value clipping. The return population is absorbed only after all
+        # epochs have finished.
+        self.memory.set_tensor_by_name("values", self._value_preprocessor(values))
+        self.memory.set_tensor_by_name("returns", self._value_preprocessor(returns))
         self.memory.set_tensor_by_name("advantages", advantages)
 
-        # sample mini-batches from memory
+        # Prepare randomized mini-batches. A fresh permutation is produced for every epoch.
         mini_batches = max(1, min(self.cfg.mini_batches, len(self.memory)))
-        sampled_tensors = self.memory.sample_all(names=self._tensors_names, mini_batches=1)[0]
-        sampled_tensors_batches = [
-            torch.tensor_split(tensor, mini_batches) if tensor is not None else [None] * mini_batches
-            for tensor in sampled_tensors
-        ]
-        sampled_batches = [
-            [tensor_batches[i] for tensor_batches in sampled_tensors_batches] for i in range(mini_batches)
-        ]
+
+        def sample_minibatches() -> list[list[torch.Tensor]]:
+            indexes = (
+                torch.arange(len(self.memory), device=self.device)
+                if mini_batches == 1
+                else torch.randperm(len(self.memory), device=self.device)
+            )
+            return [
+                self.memory.sample_by_index(names=self._tensors_names, indexes=batch)[0]
+                for batch in torch.tensor_split(indexes, mini_batches)
+            ]
 
         cumulative_policy_loss = 0
         cumulative_entropy_loss = 0
@@ -396,11 +512,14 @@ class PPO(Agent):
         explained_variance_residual_sumsq = 0
         update_early_stop = False
         optimizer_steps = 0
+        initial_replay_max_abs_log_ratio = 0.0
 
         # learning epochs
         for epoch in range(self.cfg.learning_epochs):
-            kl_divergences = []
+            epoch_kl_sum = torch.zeros((), dtype=torch.float64, device=self.device)
+            epoch_kl_samples = 0
             epoch_optimizer_steps = 0
+            sampled_batches = sample_minibatches()
 
             # mini-batches loop
             for (
@@ -421,24 +540,31 @@ class PPO(Agent):
 
                     _, outputs = self.policy.act({**inputs, "taken_actions": sampled_actions}, role="policy")
                     next_log_prob = outputs["log_prob"]
+                    validate_scalar_output(
+                        "PPO replay log_prob", next_log_prob, sampled_log_prob.shape[0], synchronize=True
+                    )
                     lower, upper = 1.0 - self.cfg.ratio_clip, 1.0 + self.cfg.ratio_clip
                     log_ratio = next_log_prob - sampled_log_prob
                     ratio = torch.exp(log_ratio)
+                    require_finite("PPO importance ratio", ratio, synchronize=True)
 
                     # compute approximate KL divergence
                     with torch.no_grad():
                         ratio_detached = ratio.detach().float()
                         log_ratio_detached = log_ratio.detach().float()
                         kl_divergence = ((ratio_detached - 1) - log_ratio_detached).mean()
-                        kl_divergences.append(kl_divergence)
                         ratio_clipped_detached = torch.clip(ratio_detached, lower, upper)
                         clip_fraction = (torch.abs(ratio_detached - 1.0) > self.cfg.ratio_clip).float().mean()
                         clip_magnitude = torch.abs(ratio_detached - ratio_clipped_detached).mean()
                         observed_batch_samples = ratio_detached.numel()
                         is_ratio_sum = ratio_detached.sum()
                         is_ratio_sumsq = ratio_detached.pow(2).sum()
+                        epoch_kl_sum += kl_divergence.double() * observed_batch_samples
+                        epoch_kl_samples += observed_batch_samples
 
                     observed_minibatches += 1
+                    if observed_minibatches == 1:
+                        initial_replay_max_abs_log_ratio = log_ratio_detached.abs().max().item()
                     kl_value = kl_divergence.item()
                     observed_samples += observed_batch_samples
                     cumulative_approx_kl += kl_value * observed_batch_samples
@@ -480,6 +606,9 @@ class PPO(Agent):
 
                     # compute value loss
                     predicted_values_raw, _ = self.value.act(inputs, role="value")
+                    validate_scalar_output(
+                        "PPO replay value", predicted_values_raw, sampled_returns.shape[0], synchronize=True
+                    )
 
                     with torch.no_grad():
                         returns_detached = sampled_returns.detach().float()
@@ -495,17 +624,26 @@ class PPO(Agent):
                         value_delta = predicted_values_raw - sampled_values
                         with torch.no_grad():
                             value_clip_fraction = (torch.abs(value_delta) > self.cfg.value_clip).float().mean()
-                        predicted_values = sampled_values + torch.clip(
+                        predicted_values_clipped = sampled_values + torch.clip(
                             value_delta, min=-self.cfg.value_clip, max=self.cfg.value_clip
                         )
+                        value_error = (sampled_returns - predicted_values_raw).pow(2)
+                        value_error_clipped = (sampled_returns - predicted_values_clipped).pow(2)
+                        value_loss = self.cfg.value_loss_scale * torch.maximum(
+                            value_error, value_error_clipped
+                        ).mean()
                     else:
-                        predicted_values = predicted_values_raw
                         value_clip_fraction = torch.zeros((), device=sampled_values.device)
-                    value_loss = self.cfg.value_loss_scale * F.mse_loss(sampled_returns, predicted_values)
+                        value_loss = self.cfg.value_loss_scale * F.mse_loss(
+                            sampled_returns, predicted_values_raw
+                        )
+
+                    total_loss = policy_loss + entropy_loss + value_loss
+                    require_finite("PPO loss", total_loss, synchronize=True)
 
                 # optimization step
                 self.optimizer.zero_grad()
-                self.scaler.scale(policy_loss + entropy_loss + value_loss).backward()
+                self.scaler.scale(total_loss).backward()
 
                 if config.torch.is_distributed:
                     self.policy.reduce_parameters()
@@ -527,7 +665,13 @@ class PPO(Agent):
                             grad_norm += parameter.grad.detach().pow(2).sum()
                     grad_norm = torch.sqrt(grad_norm)
 
-                track_optimizer_step = self.scheduler is not None and self.scaler.is_enabled()
+                # GradScaler owns non-finite gradient recovery under AMP. Without AMP,
+                # reject a finite-loss/non-finite-gradient update before it can corrupt
+                # model parameters (and synchronize that decision across workers).
+                if not self.scaler.is_enabled():
+                    require_finite("PPO gradient norm", grad_norm, synchronize=True)
+
+                track_optimizer_step = self.scaler.is_enabled()
                 scale_before_step = self.scaler.get_scale() if track_optimizer_step else None
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
@@ -562,11 +706,18 @@ class PPO(Agent):
                 if isinstance(self.scheduler, KLAdaptiveLR) and (
                     epoch_optimizer_steps or (update_early_stop and optimizer_steps > 0)
                 ):
-                    kl = torch.stack(kl_divergences).mean()
-                    # reduce (collect from all workers/processes) KL in distributed runs
+                    # Weight uneven mini-batches by their actual sample counts.
                     if config.torch.is_distributed:
-                        torch.distributed.all_reduce(kl, op=torch.distributed.ReduceOp.SUM)
-                        kl /= config.torch.world_size
+                        stats = torch.stack(
+                            (
+                                epoch_kl_sum,
+                                torch.tensor(float(epoch_kl_samples), dtype=torch.float64, device=self.device),
+                            )
+                        )
+                        torch.distributed.all_reduce(stats, op=torch.distributed.ReduceOp.SUM)
+                        kl = stats[0] / stats[1].clamp_min(1)
+                    else:
+                        kl = epoch_kl_sum / max(epoch_kl_samples, 1)
                     self.scheduler.step(kl.item())
                 elif epoch_optimizer_steps:
                     self.scheduler.step()
@@ -589,16 +740,38 @@ class PPO(Agent):
             state_batches = torch.tensor_split(states, preprocessor_batches) if states is not None else None
             observation_update_stats = getattr(self._observation_preprocessor, "update_stats", None)
             state_update_stats = getattr(self._state_preprocessor, "update_stats", None)
+            observation_update_stats_distributed = getattr(
+                self._observation_preprocessor, "update_stats_distributed", None
+            )
+            state_update_stats_distributed = getattr(
+                self._state_preprocessor, "update_stats_distributed", None
+            )
             for i, observation_batch in enumerate(observation_batches):
-                if observation_update_stats is not None:
+                if observation_update_stats_distributed is not None:
+                    observation_update_stats_distributed(observation_batch)
+                elif observation_update_stats is not None:
                     observation_update_stats(observation_batch)
                 else:
                     self._observation_preprocessor(observation_batch, train=True)
                 if state_batches is not None:
-                    if state_update_stats is not None:
+                    if state_update_stats_distributed is not None:
+                        state_update_stats_distributed(state_batches[i])
+                    elif state_update_stats is not None:
                         state_update_stats(state_batches[i])
                     else:
                         self._state_preprocessor(state_batches[i], train=True)
+
+            value_update_stats = getattr(self._value_preprocessor, "update_stats", None)
+            value_update_stats_distributed = getattr(
+                self._value_preprocessor, "update_stats_distributed", None
+            )
+            flat_returns = returns.flatten(0, 1)
+            if value_update_stats_distributed is not None:
+                value_update_stats_distributed(flat_returns)
+            elif value_update_stats is not None:
+                value_update_stats(flat_returns)
+            else:
+                self._value_preprocessor(flat_returns, train=True)
 
         # record data
         observed_samples_safe = max(observed_samples, 1)
@@ -632,13 +805,44 @@ class PPO(Agent):
         self.track_data("Policy / IS ratio (mean)", is_ratio_mean)
         self.track_data("Policy / IS ratio (std)", is_ratio_var**0.5)
         self.track_data("Policy / Entropy", cumulative_entropy / entropy_samples_safe)
-        self.track_data("Policy / Standard deviation", self.policy.distribution(role="policy").stddev.mean().item())
+        policy_distribution = self.policy.distribution(role="policy")
+        policy_stddev = policy_distribution.stddev.float().mean()
+        if torch.isfinite(policy_stddev):
+            self.track_data("Policy / Standard deviation", policy_stddev.item())
+        elif hasattr(policy_distribution, "probs"):
+            self.track_data(
+                "Policy / Maximum action probability",
+                policy_distribution.probs.float().amax(dim=-1).mean().item(),
+            )
         self.track_data("Value / Explained variance", explained_variance)
         self.track_data("Value / Clip fraction", cumulative_value_clip_fraction / effective_samples_safe)
         self.track_data("Optimization / Grad norm", cumulative_grad_norm / effective_minibatches_safe)
         self.track_data("Optimization / KL early-stop count", kl_early_stop_count)
         self.track_data("Optimization / Effective minibatches", effective_minibatches)
         self.track_data("Optimization / Observed minibatches", observed_minibatches)
+        self.track_data("Optimization / Successful optimizer steps", optimizer_steps)
+        self.track_data("Optimization / Observed samples", observed_samples)
+        self.track_data("Optimization / Effective samples", effective_samples)
+        self.track_data("Policy / Initial replay max abs log-ratio", initial_replay_max_abs_log_ratio)
 
-        if self.scheduler:
-            self.track_data("Learning / Learning rate", self.scheduler.get_last_lr()[0])
+        for name, preprocessor in (
+            ("Observation", self._observation_preprocessor),
+            ("State", self._state_preprocessor),
+            ("Value", self._value_preprocessor),
+        ):
+            count = getattr(preprocessor, "current_count", None)
+            if count is not None:
+                self.track_data(f"Preprocessor / {name} sample count", float(count.item()))
+
+        learning_rates = (
+            self.scheduler.get_last_lr()
+            if self.scheduler
+            else [group["lr"] for group in self.optimizer.param_groups]
+        )
+        self.track_data("Learning / Learning rate", learning_rates[0])
+        self.track_data("Learning / Policy learning rate", learning_rates[0])
+        self.track_data(
+            "Learning / Value learning rate",
+            learning_rates[1] if len(learning_rates) > 1 else learning_rates[0],
+        )
+        self._rollout_consumed = True

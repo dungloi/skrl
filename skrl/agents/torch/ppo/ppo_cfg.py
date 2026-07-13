@@ -54,7 +54,8 @@ class PPO_CFG(AgentCfg):
     See :ref:`learning_rate_schedulers` for more details.
 
     * If a class is provided, the same learning rate scheduler will be used for the networks.
-    * If a tuple is provided, its elements will be used for each network in order.
+    PPO uses one optimizer with separate policy/value parameter groups, so both tuple entries
+    must currently name the same scheduler type.
     """
 
     learning_rate_scheduler_kwargs: dict | tuple[dict, dict] = dataclasses.field(default_factory=dict)
@@ -67,8 +68,8 @@ class PPO_CFG(AgentCfg):
         The ``optimizer`` argument is automatically passed to the learning rate scheduler's constructor.
         Therefore, it must not be provided in the keyword arguments.
 
-    * If a dictionary is provided, the same keyword arguments will be used for the networks.
-    * If a tuple is provided, its elements will be used for each network in order.
+    * If a dictionary is provided, the same keyword arguments will be used for both groups.
+    * If a tuple is provided, both dictionaries must currently be identical.
     """
 
     observation_preprocessor: type | None = None
@@ -108,7 +109,12 @@ class PPO_CFG(AgentCfg):
     """
 
     random_timesteps: int = 0
-    """Number of random exploration (sampling random actions) steps to perform before sampling actions from the policy."""
+    """Number of random warm-up steps before sampling actions from the policy.
+
+    Random transitions are intentionally excluded from PPO's on-policy rollout. Recurrent
+    state still advances during warm-up, and a complete policy-generated rollout is collected
+    before the first update.
+    """
 
     learning_starts: int = 0
     """Number of steps to perform before calling the algorithm update function."""
@@ -138,7 +144,12 @@ class PPO_CFG(AgentCfg):
     """KL-divergence threshold for early stopping."""
 
     time_limit_bootstrap: bool = False
-    """Whether to bootstrap at timeout termination (episode truncation)."""
+    """Whether to bootstrap at timeout termination (episode truncation).
+
+    ``next_observations`` / ``next_states`` supplied to the agent must represent the final
+    pre-reset state for truncated environments. Auto-reset wrappers must preserve that state;
+    using a reset observation would produce an invalid bootstrap target.
+    """
 
     rewards_shaper: Callable | None = None
     """Rewards shaping function."""
