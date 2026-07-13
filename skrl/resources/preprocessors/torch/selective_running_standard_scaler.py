@@ -96,6 +96,22 @@ class SelectiveRunningStandardScaler(nn.Module):
             offset += width
         return output
 
+    def update_stats(self, x: torch.Tensor | None) -> None:
+        """Update the selected running statistics without cloning/scattering the full input tensor."""
+        if x is None or self._selected_size == 0:
+            return
+        with torch.no_grad():
+            selected = self._gather_selected(x)
+            reduce_dims = tuple(range(selected.dim() - 1))
+            input_count = 1
+            for dim in selected.shape[:-1]:
+                input_count *= int(dim)
+            self._parallel_variance(
+                torch.mean(selected, dim=reduce_dims),
+                torch.var(selected, dim=reduce_dims, unbiased=False),
+                input_count,
+            )
+
     def _compute(self, x: torch.Tensor, *, train: bool = False, inverse: bool = False) -> torch.Tensor:
         if self._selected_size == 0:
             return x
@@ -103,15 +119,7 @@ class SelectiveRunningStandardScaler(nn.Module):
         selected = self._gather_selected(x)
 
         if train:
-            reduce_dims = tuple(range(selected.dim() - 1))
-            input_count = 1
-            for dim in selected.shape[:-1]:
-                input_count *= int(dim)
-            self._parallel_variance(
-                torch.mean(selected, dim=reduce_dims),
-                torch.var(selected, dim=reduce_dims),
-                input_count,
-            )
+            self.update_stats(x)
 
         if inverse:
             selected = (

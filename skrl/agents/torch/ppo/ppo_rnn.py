@@ -57,7 +57,7 @@ def compute_gae(
     # returns computation
     returns = advantages + values
     # normalize advantages
-    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+    advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
 
     return returns, advantages
 
@@ -384,7 +384,14 @@ class PPO_RNN(Agent):
                     for rnn_state in self._rnn_final_states["value"]:
                         rnn_state[:, finished_episodes[:, 0]] = 0
 
-            self._rnn_initial_states = self._rnn_final_states
+            # Keep a distinct container for the states used by the next action. Otherwise, assigning
+            # a new final state in act() also overwrites the initial state that record_transition()
+            # must store for replay.
+            policy_states = list(self._rnn_final_states["policy"])
+            self._rnn_initial_states = {
+                "policy": policy_states,
+                "value": policy_states if self.policy is self.value else list(self._rnn_final_states["value"]),
+            }
 
     def pre_interaction(self, *, timestep: int, timesteps: int) -> None:
         """Method called before the interaction with the environment.
@@ -444,17 +451,48 @@ class PPO_RNN(Agent):
         self.memory.set_tensor_by_name("advantages", advantages)
 
         # sample mini-batches from memory
-        sampled_batches = self.memory.sample_all(
-            names=self._tensors_names, mini_batches=self.cfg.mini_batches, sequence_length=self._rnn_sequence_length
-        )
-
         rnn_policy, rnn_value = {}, {}
-        if self._rnn:
-            sampled_rnn_batches = self.memory.sample_all(
-                names=self._rnn_tensors_names,
-                mini_batches=self.cfg.mini_batches,
-                sequence_length=self._rnn_sequence_length,
+        if self._rnn_sequence_length > 1:
+            if self.memory.memory_size % self._rnn_sequence_length:
+                raise ValueError(
+                    f"PPO_RNN rollout length ({self.memory.memory_size}) must be divisible by the RNN sequence "
+                    f"length ({self._rnn_sequence_length})"
+                )
+            sequence_count = len(self.memory) // self._rnn_sequence_length
+            mini_batches = max(1, min(self.cfg.mini_batches, sequence_count))
+            sequence_indexes = torch.as_tensor(self.memory.all_sequence_indexes, device=self.device).view(
+                -1, self._rnn_sequence_length
             )
+            index_batches = [batch.flatten() for batch in torch.tensor_split(sequence_indexes, mini_batches)]
+            sampled_batches = [
+                self.memory.sample_by_index(names=self._tensors_names, indexes=indexes)[0]
+                for indexes in index_batches
+            ]
+            if self._rnn:
+                sampled_rnn_batches = [
+                    self.memory.sample_by_index(names=self._rnn_tensors_names, indexes=indexes)[0]
+                    for indexes in index_batches
+                ]
+        else:
+            mini_batches = max(1, min(self.cfg.mini_batches, len(self.memory)))
+            sampled_tensors = self.memory.sample_all(names=self._tensors_names, mini_batches=1)[0]
+            sampled_tensors_batches = [
+                torch.tensor_split(tensor, mini_batches) if tensor is not None else [None] * mini_batches
+                for tensor in sampled_tensors
+            ]
+            sampled_batches = [
+                [tensor_batches[i] for tensor_batches in sampled_tensors_batches] for i in range(mini_batches)
+            ]
+            if self._rnn:
+                sampled_rnn_tensors = self.memory.sample_all(names=self._rnn_tensors_names, mini_batches=1)[0]
+                sampled_rnn_tensors_batches = [
+                    torch.tensor_split(tensor, mini_batches) if tensor is not None else [None] * mini_batches
+                    for tensor in sampled_rnn_tensors
+                ]
+                sampled_rnn_batches = [
+                    [tensor_batches[i] for tensor_batches in sampled_rnn_tensors_batches]
+                    for i in range(mini_batches)
+                ]
 
         cumulative_policy_loss = 0
         cumulative_entropy_loss = 0
@@ -479,10 +517,13 @@ class PPO_RNN(Agent):
         explained_variance_returns_sumsq = 0
         explained_variance_residual_sum = 0
         explained_variance_residual_sumsq = 0
+        update_early_stop = False
+        optimizer_steps = 0
 
         # learning epochs
         for epoch in range(self.cfg.learning_epochs):
             kl_divergences = []
+            epoch_optimizer_steps = 0
 
             # mini-batches loop
             for i, (
@@ -527,8 +568,8 @@ class PPO_RNN(Agent):
 
                 with torch.autocast(device_type=self._device_type, enabled=self.cfg.mixed_precision):
                     inputs = {
-                        "observations": self._observation_preprocessor(sampled_observations, train=not epoch),
-                        "states": self._state_preprocessor(sampled_states, train=not epoch),
+                        "observations": self._observation_preprocessor(sampled_observations),
+                        "states": self._state_preprocessor(sampled_states),
                     }
 
                     _, outputs = self.policy.act(
@@ -563,8 +604,18 @@ class PPO_RNN(Agent):
                     cumulative_is_ratio_sumsq += is_ratio_sumsq.item()
 
                     # early stopping with KL divergence
-                    if self.cfg.kl_threshold and kl_divergence > self.cfg.kl_threshold:
+                    should_early_stop = False
+                    if self.cfg.kl_threshold:
+                        early_stop_kl = kl_divergence.detach().clone()
+                        # use the global mean so all workers follow the same control flow and the
+                        # stopping statistic matches the KL-adaptive scheduler statistic
+                        if config.torch.is_distributed:
+                            torch.distributed.all_reduce(early_stop_kl, op=torch.distributed.ReduceOp.SUM)
+                            early_stop_kl /= config.torch.world_size
+                        should_early_stop = bool((early_stop_kl > self.cfg.kl_threshold).item())
+                    if should_early_stop:
                         kl_early_stop_count += 1
+                        update_early_stop = True
                         break
 
                     # compute entropy loss
@@ -631,8 +682,20 @@ class PPO_RNN(Agent):
                             grad_norm += parameter.grad.detach().pow(2).sum()
                     grad_norm = torch.sqrt(grad_norm)
 
+                track_optimizer_step = self.scheduler is not None and self.scaler.is_enabled()
+                scale_before_step = self.scaler.get_scale() if track_optimizer_step else None
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
+                optimizer_step_succeeded = not track_optimizer_step or self.scaler.get_scale() >= scale_before_step
+                if config.torch.is_distributed and track_optimizer_step:
+                    optimizer_step_succeeded_tensor = torch.tensor(
+                        optimizer_step_succeeded, dtype=torch.int32, device=self.device
+                    )
+                    torch.distributed.all_reduce(optimizer_step_succeeded_tensor, op=torch.distributed.ReduceOp.MIN)
+                    optimizer_step_succeeded = bool(optimizer_step_succeeded_tensor.item())
+                if optimizer_step_succeeded:
+                    epoch_optimizer_steps += 1
+                    optimizer_steps += 1
 
                 # update cumulative losses
                 cumulative_policy_loss += policy_loss.item()
@@ -649,18 +712,48 @@ class PPO_RNN(Agent):
 
             # update learning rate
             if self.scheduler:
-                if isinstance(self.scheduler, KLAdaptiveLR):
-                    if kl_divergences:
-                        kl = torch.stack(kl_divergences).mean()
-                    else:
-                        kl = torch.zeros((), device=self.device)
+                # A terminal KL at the start of an epoch can be the first observation of the
+                # preceding epoch's final optimizer step, so report it once to KLAdaptiveLR.
+                if isinstance(self.scheduler, KLAdaptiveLR) and (
+                    epoch_optimizer_steps or (update_early_stop and optimizer_steps > 0)
+                ):
+                    kl = torch.stack(kl_divergences).mean()
                     # reduce (collect from all workers/processes) KL in distributed runs
                     if config.torch.is_distributed:
                         torch.distributed.all_reduce(kl, op=torch.distributed.ReduceOp.SUM)
                         kl /= config.torch.world_size
                     self.scheduler.step(kl.item())
-                else:
+                elif epoch_optimizer_steps:
                     self.scheduler.step()
+
+            # a KL early-stop applies to the complete PPO update, not only to the current epoch
+            if update_early_stop:
+                break
+
+        # Keep input normalization fixed from rollout collection through optimization. Only after
+        # the update is complete, absorb each rollout sample once for use by the next rollout.
+        del inputs
+        observations = self.memory.get_tensor_by_name("observations").flatten(0, 1)
+        states = self.memory.get_tensor_by_name("states").flatten(0, 1) if self.state_space is not None else None
+        sample_count = observations.shape[0]
+        if sample_count:
+            # Bound the output allocation for large observations while keeping at least two samples
+            # per chunk when the rollout contains more than one sample.
+            preprocessor_batches = min(mini_batches, max(sample_count // 2, 1))
+            observation_batches = torch.tensor_split(observations, preprocessor_batches)
+            state_batches = torch.tensor_split(states, preprocessor_batches) if states is not None else None
+            observation_update_stats = getattr(self._observation_preprocessor, "update_stats", None)
+            state_update_stats = getattr(self._state_preprocessor, "update_stats", None)
+            for i, observation_batch in enumerate(observation_batches):
+                if observation_update_stats is not None:
+                    observation_update_stats(observation_batch)
+                else:
+                    self._observation_preprocessor(observation_batch, train=True)
+                if state_batches is not None:
+                    if state_update_stats is not None:
+                        state_update_stats(state_batches[i])
+                    else:
+                        self._state_preprocessor(state_batches[i], train=True)
 
         # record data
         observed_samples_safe = max(observed_samples, 1)

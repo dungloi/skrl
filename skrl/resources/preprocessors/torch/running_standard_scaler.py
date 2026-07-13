@@ -69,6 +69,20 @@ class RunningStandardScaler(nn.Module):
         self.running_variance = M2 / total_count
         self.current_count = total_count
 
+    def update_stats(self, x: torch.Tensor | None) -> None:
+        """Update the running statistics without constructing a standardized output tensor."""
+        if x is None:
+            return
+        with torch.no_grad():
+            if x.dim() == 3:
+                self._parallel_variance(
+                    torch.mean(x, dim=(0, 1)),
+                    torch.var(x, dim=(0, 1), unbiased=False),
+                    x.shape[0] * x.shape[1],
+                )
+            else:
+                self._parallel_variance(torch.mean(x, dim=0), torch.var(x, dim=0, unbiased=False), x.shape[0])
+
     def _compute(self, x: torch.Tensor, *, train: bool = False, inverse: bool = False) -> torch.Tensor:
         """Compute the standardization of the input data.
 
@@ -79,10 +93,7 @@ class RunningStandardScaler(nn.Module):
         :return: Standardized tensor.
         """
         if train:
-            if x.dim() == 3:
-                self._parallel_variance(torch.mean(x, dim=(0, 1)), torch.var(x, dim=(0, 1)), x.shape[0] * x.shape[1])
-            else:
-                self._parallel_variance(torch.mean(x, dim=0), torch.var(x, dim=0), x.shape[0])
+            self.update_stats(x)
 
         # scale back the data to the original representation
         if inverse:

@@ -202,6 +202,8 @@ def test_agent(
         "discount_factor": discount_factor,
         "lambda_": lambda_,
         "learning_rate": learning_rate,
+        "optimizer": "Adam",
+        "optimizer_kwargs": {},
         "learning_rate_scheduler": learning_rate_scheduler,
         "learning_rate_scheduler_kwargs": {},
         "observation_preprocessor": observation_preprocessor,
