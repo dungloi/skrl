@@ -10,8 +10,8 @@
 - ``CNNGRUAttentionMLPPolicy``：融合 CNN 图像特征、GRU 时序记忆与 attention 交互特征输出动作均值
 - ``CNNGRUAttentionMLPValue``：复用同一融合路径并输出标量 value
 
-网络结构由 ``network.cnn``、``network.attention``、``network.gru``、``network.mlp``
-四段配置驱动。
+网络结构由 ``network.cnn``、``network.ego``、``network.attention``、``network.gru``、
+``network.mlp`` 配置驱动。
 """
 
 from __future__ import annotations
@@ -30,6 +30,7 @@ from .utils import (
     _build_mlp,
     _normalize_attention_cfg,
     _normalize_cnn_cfg,
+    _normalize_ego_cfg,
     _normalize_gru_cfg,
     _normalize_mlp_cfg,
     _normalize_network_root,
@@ -190,14 +191,19 @@ class _CNNGRUAttentionMLPCommon:
             network_raw_cfg,
             required_keys=_CNN_GRU_ATTENTION_MLP_REQUIRED_KEYS,
             model_name=model_name,
+            optional_keys={"ego"},
         )
         cnn_cfg = _normalize_cnn_cfg(network_cfg.get("cnn"))
         attention_cfg = _normalize_attention_cfg(network_cfg.get("attention"))
+        ego_cfg = _normalize_ego_cfg(
+            network_cfg.get("ego"), default_fusion_dim=attention_cfg["embed_dim"]
+        )
         gru_cfg = _normalize_gru_cfg(network_cfg.get("gru"))
         mlp_cfg = _normalize_mlp_cfg(network_cfg.get("mlp"))
 
         embed_dim = attention_cfg["embed_dim"]
         num_heads = attention_cfg["num_heads"]
+        ego_fusion_dim = ego_cfg["fusion_dim"]
         self.sequence_length = gru_cfg["sequence_length"]
         self.num_layers = gru_cfg["num_layers"]
         self.hidden_size = gru_cfg["hidden_size"]
@@ -254,8 +260,8 @@ class _CNNGRUAttentionMLPCommon:
             nn.ReLU(),
         )
         self.ego_fusion_embedding = nn.Sequential(
-            nn.Linear(ego_input_dim, embed_dim),
-            nn.LayerNorm(embed_dim),
+            nn.Linear(ego_input_dim, ego_fusion_dim),
+            nn.LayerNorm(ego_fusion_dim),
             nn.ReLU(),
         )
         self.other_embedding = nn.Sequential(
@@ -269,7 +275,7 @@ class _CNNGRUAttentionMLPCommon:
         # valid_ratio。与 valid_count 信息等价，但固定在 [0, 1]，不依赖
         # 最大检测槽位数。无 mask 的旧模型保持原网络尺寸以兼容现有用途。
         attention_output_dim = embed_dim * self.other_history_length
-        source_input_dims = (cnn_out_dim, embed_dim, attention_output_dim)
+        source_input_dims = (cnn_out_dim, ego_fusion_dim, attention_output_dim)
         fusion_raw_dim = sum(source_input_dims) + (
             self.other_history_length if self._has_others_mask else 0
         )
@@ -279,7 +285,9 @@ class _CNNGRUAttentionMLPCommon:
                 source_input_dims, self.hidden_size
             )
             self.depth_projection = nn.Linear(cnn_out_dim, self.separate_feature_projection_dims[0])
-            self.ego_projection = nn.Linear(embed_dim, self.separate_feature_projection_dims[1])
+            self.ego_projection = nn.Linear(
+                ego_fusion_dim, self.separate_feature_projection_dims[1]
+            )
             self.others_projection = nn.Linear(
                 attention_output_dim, self.separate_feature_projection_dims[2]
             )
@@ -306,6 +314,7 @@ class _CNNGRUAttentionMLPCommon:
         self._cnn_backbone_out_shape = tuple(cnn_backbone_out.shape[1:])
         self._cnn_projection_flat_dim = cnn_projection_flat_dim
         self._attention_cfg = attention_cfg
+        self._ego_cfg = ego_cfg
         self._mlp_cfg = mlp_cfg
         self._gru_cfg = gru_cfg
         self._cnn_out_dim = cnn_out_dim
@@ -488,7 +497,7 @@ class CNNGRUAttentionMLPPolicy(_CNNGRUAttentionMLPCommon, GaussianMixin, Model):
     """融合 CNN 图像、GRU 时序记忆与 attention 特征的 Gaussian policy。
 
     期望的网络配置:
-        network.cnn + network.attention + network.gru + network.mlp
+        network.cnn + optional network.ego + network.attention + network.gru + network.mlp
     """
 
     def __init__(
@@ -528,7 +537,8 @@ class CNNGRUAttentionMLPPolicy(_CNNGRUAttentionMLPCommon, GaussianMixin, Model):
             fixed_log_std: 是否固定 log std（不可训练）。
             num_envs: recurrent 模型对应的环境数，用于构造 hidden state 规格。
             **kwargs: 额外参数，必须包含 `network`，且其中包含
-                `cnn`、`attention`、`gru`、`mlp` 配置段。
+                `cnn`、`attention`、`gru`、`mlp` 配置段；可选 `ego` 配置段
+                用于设置直接融合分支维度。
         """
         # ----------------------------------------
         # 基类初始化
@@ -612,6 +622,12 @@ class CNNGRUAttentionMLPPolicy(_CNNGRUAttentionMLPCommon, GaussianMixin, Model):
             ],
         )
         _print_subconfig(
+            "ego",
+            [
+                ("fusion_dim", self._ego_cfg["fusion_dim"]),
+            ],
+        )
+        _print_subconfig(
             "attention",
             [
                 ("embed_dim", self._attention_cfg["embed_dim"]),
@@ -677,7 +693,7 @@ class CNNGRUAttentionMLPValue(_CNNGRUAttentionMLPCommon, DeterministicMixin, Mod
     """融合 CNN 图像、GRU 时序记忆与 attention 特征的 deterministic value 模型。
 
     期望的网络配置:
-        network.cnn + network.attention + network.gru + network.mlp
+        network.cnn + optional network.ego + network.attention + network.gru + network.mlp
     """
 
     def __init__(
@@ -703,7 +719,8 @@ class CNNGRUAttentionMLPValue(_CNNGRUAttentionMLPCommon, DeterministicMixin, Mod
             role: skrl 使用的模型角色名。
             num_envs: recurrent 模型对应的环境数，用于构造 hidden state 规格。
             **kwargs: 额外参数，必须包含 `network`，且其中包含
-                `cnn`、`attention`、`gru`、`mlp` 配置段。
+                `cnn`、`attention`、`gru`、`mlp` 配置段；可选 `ego` 配置段
+                用于设置直接融合分支维度。
         """
         # ----------------------------------------
         # 基类初始化
@@ -758,6 +775,12 @@ class CNNGRUAttentionMLPValue(_CNNGRUAttentionMLPCommon, DeterministicMixin, Mod
                 ("paddings", self._cnn_cfg["paddings"]),
                 ("output_dim", self._cnn_cfg["output_dim"]),
                 ("activation", self._cnn_cfg["activation"]),
+            ],
+        )
+        _print_subconfig(
+            "ego",
+            [
+                ("fusion_dim", self._ego_cfg["fusion_dim"]),
             ],
         )
         _print_subconfig(

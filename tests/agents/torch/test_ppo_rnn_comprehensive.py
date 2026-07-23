@@ -1418,6 +1418,7 @@ def _multimodal_network(sequence_length: int) -> dict[str, Any]:
             "paddings": [[0, 0]],
             "activation": "relu",
         },
+        "ego": {"fusion_dim": 3},
         "attention": {"embed_dim": 2, "num_heads": 1},
         "gru": {"hidden_size": 4, "num_layers": 1, "sequence_length": sequence_length},
         "mlp": {"hidden_dims": [4], "use_layernorm": False, "activation": "relu"},
@@ -1496,10 +1497,10 @@ def test_separate_feature_projection_bypasses_fusion_and_preserves_gru_input_siz
     )
 
     assert policy.fusion_layer is None
-    assert policy.separate_feature_projection_dims == (2, 1, 1)
+    assert policy.separate_feature_projection_dims == (1, 2, 1)
     assert sum(policy.separate_feature_projection_dims) == policy.hidden_size
     assert policy.depth_projection.in_features == 2
-    assert policy.ego_projection.in_features == 2
+    assert policy.ego_projection.in_features == 3
     assert policy.others_projection.in_features == 2
 
     native = {
@@ -1647,6 +1648,7 @@ def _deployment_network() -> dict[str, Any]:
             "output_dim": 48,
             "activation": "relu",
         },
+        "ego": {"fusion_dim": 30},
         "attention": {"embed_dim": 64, "num_heads": 4},
         "gru": {"hidden_size": 64, "num_layers": 1, "sequence_length": 40},
         "mlp": {"hidden_dims": [32], "use_layernorm": True, "activation": "relu"},
@@ -1707,6 +1709,9 @@ def test_deployment_shape_full_ppo_rnn_update_smoke(record_property):
         assert isinstance(projection[1], nn.Linear)
         assert projection[1].in_features == 72
         assert projection[1].out_features == 48
+        assert model.ego_query_embedding[0].out_features == 64
+        assert model.ego_fusion_embedding[0].out_features == 30
+        assert model._source_input_dims == (48, 30, 64)
     cfg = _agent_cfg(
         rollouts=rollouts,
         learning_epochs=5,

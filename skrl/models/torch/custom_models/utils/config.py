@@ -112,6 +112,7 @@ def _normalize_network_root(
     *,
     required_keys: set[str],
     model_name: str,
+    optional_keys: set[str] | None = None,
 ) -> dict[str, Any]:
     """校验模型级 `network` 配置。
 
@@ -119,6 +120,7 @@ def _normalize_network_root(
         raw_cfg: 原始 `network` 配置对象。
         required_keys: 必需的一级模块 key 集合。
         model_name: 模型名，用于报错信息上下文。
+        optional_keys: 当前模型允许但不强制提供的一级模块 key 集合。
 
     Returns:
         通过校验的 `network` 映射。
@@ -131,12 +133,34 @@ def _normalize_network_root(
         raise ValueError(
             f"[{model_name}] Missing or invalid `network` config: expected keys {sorted(required_keys)}"
         )
-    # 顶层只允许当前模型声明的模块 key
-    _check_unknown_keys(raw_cfg, required_keys, f"{model_name}.network")
+    # 顶层只允许当前模型声明的必需或可选模块 key
+    allowed_keys = required_keys | (optional_keys or set())
+    _check_unknown_keys(raw_cfg, allowed_keys, f"{model_name}.network")
     missing_keys = sorted(required_keys - set(raw_cfg.keys()))
     if missing_keys:
         raise ValueError(f"[{model_name}] Missing required `network` keys: {missing_keys}")
     return raw_cfg
+
+
+def _normalize_ego_cfg(raw_cfg: Any, *, default_fusion_dim: int) -> dict[str, int]:
+    """校验 ego 直接融合分支配置，并为旧配置提供兼容默认值。"""
+    if raw_cfg is None:
+        return {"fusion_dim": default_fusion_dim}
+    if not isinstance(raw_cfg, dict):
+        raise ValueError("Invalid `network.ego` config: expected a mapping")
+
+    required_keys = {"fusion_dim"}
+    _check_unknown_keys(raw_cfg, required_keys, "network.ego")
+    missing_keys = sorted(required_keys - set(raw_cfg.keys()))
+    if missing_keys:
+        raise ValueError(f"Missing required `network.ego` keys: {missing_keys}")
+
+    fusion_dim = raw_cfg["fusion_dim"]
+    if not isinstance(fusion_dim, int) or fusion_dim <= 0:
+        raise ValueError(
+            f"Invalid `network.ego.fusion_dim`: expected a positive integer, got {fusion_dim}"
+        )
+    return {"fusion_dim": fusion_dim}
 
 
 def _normalize_cnn_cfg(raw_cfg: Any) -> dict[str, Any]:
