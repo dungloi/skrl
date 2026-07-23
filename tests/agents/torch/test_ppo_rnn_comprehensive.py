@@ -1479,6 +1479,36 @@ def test_attention_fusion_receives_valid_ratio_derived_from_mask():
     torch.testing.assert_close(fusion_inputs[0][:, -1], torch.tensor([0.5, 1.0]))
 
 
+def test_attention_masked_rows_support_autocast_output_dtype():
+    observation_space = _multimodal_space()
+    action_space = gymnasium.spaces.Box(-1, 1, shape=(2,))
+    policy = CNNGRUAttentionMLPPolicy(
+        observation_space=observation_space,
+        state_space=observation_space,
+        action_space=action_space,
+        device="cpu",
+        num_envs=2,
+        network=_multimodal_network(sequence_length=1),
+        reduction="sum",
+    )
+    native = {
+        "image": torch.zeros((2, 1, 3, 3)),
+        "ego": torch.zeros((2, 2)),
+        "other_0": torch.zeros((2, 1, 2)),
+        "other_1": torch.zeros((2, 1, 2)),
+        # Mix an all-masked row with a valid row to exercise attention backfilling.
+        "others_mask": torch.tensor([[0.0, 0.0], [1.0, 0.0]]),
+    }
+    observations = flatten_tensorized_space(native)
+
+    policy.eval()
+    with torch.no_grad(), torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        actions, _ = policy.compute({"observations": observations}, role="policy")
+
+    assert actions.shape == (2, 2)
+    assert torch.isfinite(actions).all()
+
+
 def test_separate_feature_projection_bypasses_fusion_and_preserves_gru_input_size():
     observation_space = _multimodal_space()
     action_space = gymnasium.spaces.Box(-1, 1, shape=(2,))

@@ -453,13 +453,6 @@ class _CNNGRUAttentionMLPCommon:
         if key_padding_mask is None:
             attention_output, _ = self.attention(query=query, key=other_key_value, value=other_key_value)
         else:
-            attention_output = torch.zeros(
-                batch_size * other_history_length,
-                1,
-                query.shape[-1],
-                device=query.device,
-                dtype=query.dtype,
-            )
             valid_rows = ~all_masked
             if torch.any(valid_rows):
                 valid_attention_output, _ = self.attention(
@@ -468,7 +461,21 @@ class _CNNGRUAttentionMLPCommon:
                     value=other_key_value[valid_rows],
                     key_padding_mask=key_padding_mask[valid_rows],
                 )
+                # Under autocast, MultiheadAttention can return fp16/bf16 even
+                # when its input tensor is fp32. Allocate from the result so
+                # masked-row backfilling always uses the same dtype.
+                attention_output = valid_attention_output.new_zeros(
+                    batch_size * other_history_length,
+                    1,
+                    valid_attention_output.shape[-1],
+                )
                 attention_output[valid_rows] = valid_attention_output
+            else:
+                attention_output = query.new_zeros(
+                    batch_size * other_history_length,
+                    1,
+                    query.shape[-1],
+                )
         attention_output = attention_output.squeeze(1).reshape(batch_size, other_history_length, -1).reshape(
             batch_size, -1
         )
