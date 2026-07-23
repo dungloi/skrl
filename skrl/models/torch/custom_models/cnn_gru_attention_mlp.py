@@ -87,11 +87,11 @@ def _extract_attention_key_padding_mask(
     *,
     num_other: int,
     other_history_length: int,
-) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-    """提取 attention 的 key_padding_mask；当前环境约定 `others_mask=True` 表示 valid。"""
+) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+    """提取 padding mask 和有效检测比例；``others_mask=True`` 表示 valid。"""
     visible_mask = data.get("others_mask")
     if visible_mask is None:
-        return None, None
+        return None, None, None
 
     if visible_mask.dim() == 2:
         if visible_mask.shape[1] != num_other:
@@ -113,10 +113,12 @@ def _extract_attention_key_padding_mask(
             f"got {tuple(visible_mask.shape)}"
         )
 
-    key_padding_mask = ~(visible_mask > 0.5)
+    visible_mask = visible_mask > 0.5
+    valid_ratio = visible_mask.permute(0, 2, 1).to(dtype=torch.float32).mean(dim=-1)
+    key_padding_mask = ~visible_mask
     key_padding_mask = key_padding_mask.permute(0, 2, 1).reshape(-1, num_other)
     all_masked = key_padding_mask.all(dim=1)
-    return key_padding_mask, all_masked
+    return key_padding_mask, all_masked, valid_ratio
 
 
 class _CNNGRUAttentionMLPCommon:
@@ -144,6 +146,10 @@ class _CNNGRUAttentionMLPCommon:
             raise ValueError("No `other_*` keys found in input_space")
         other_shape = input_space[self.other_keys[0]].shape
         self.other_history_length, other_input_dim = _parse_other_shape(other_shape)
+        # ``gymnasium.spaces.Dict.__contains__`` checks whether an object is a
+        # valid sample, not whether a field name exists. Inspect the keys
+        # explicitly so the fusion layer reserves the valid-ratio feature.
+        self._has_others_mask = "others_mask" in input_space.keys()
 
         # 解析 "ego" 的 shape
         ego_shape = input_space["ego"].shape
@@ -217,7 +223,15 @@ class _CNNGRUAttentionMLPCommon:
         )
 
         # 7. 定义单步多模态融合层与 MLP 部分 (融合特征 -> GRU -> Action / Value)
-        fusion_raw_dim = cnn_out_dim + embed_dim + embed_dim * self.other_history_length
+        # 有 mask 的输入为每个 other history slice 额外拼接一个
+        # valid_ratio。与 valid_count 信息等价，但固定在 [0, 1]，不依赖
+        # 最大检测槽位数。无 mask 的旧模型保持原网络尺寸以兼容现有用途。
+        fusion_raw_dim = (
+            cnn_out_dim
+            + embed_dim
+            + embed_dim * self.other_history_length
+            + (self.other_history_length if self._has_others_mask else 0)
+        )
         self.fusion_layer = nn.Sequential(
             nn.Linear(fusion_raw_dim, self.hidden_size),
             nn.LayerNorm(self.hidden_size),
@@ -364,11 +378,13 @@ class _CNNGRUAttentionMLPCommon:
         query = ego_query.unsqueeze(1).expand(-1, other_history_length, -1).reshape(
             batch_size * other_history_length, 1, -1
         )
-        key_padding_mask, all_masked = _extract_attention_key_padding_mask(
+        key_padding_mask, all_masked, valid_ratio = _extract_attention_key_padding_mask(
             data,
             num_other=num_other,
             other_history_length=other_history_length,
         )
+        if valid_ratio is not None:
+            valid_ratio = valid_ratio.to(device=query.device, dtype=query.dtype)
         if key_padding_mask is None:
             attention_output, _ = self.attention(query=query, key=other_key_value, value=other_key_value)
         else:
@@ -393,7 +409,10 @@ class _CNNGRUAttentionMLPCommon:
         )
 
         # 6. 先融合单步多模态特征，再经 GRU 和 MLP 输出
-        fused_step_feature = torch.cat([img_features, ego_fusion, attention_output], dim=1)
+        fusion_features = [img_features, ego_fusion, attention_output]
+        if valid_ratio is not None:
+            fusion_features.append(valid_ratio.reshape(batch_size, -1))
+        fused_step_feature = torch.cat(fusion_features, dim=1)
         fused_step_feature = self.fusion_layer(fused_step_feature)
         recurrent_feature, hidden_states = self._run_gru(fused_step_feature, inputs)
         return self.mlp(recurrent_feature), hidden_states

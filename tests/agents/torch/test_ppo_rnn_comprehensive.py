@@ -1436,6 +1436,47 @@ def _multimodal_samples(rollouts: int, num_envs: int, *, offset: float) -> torch
     return flatten_tensorized_space(native).view(rollouts, num_envs, -1)
 
 
+def test_attention_fusion_receives_valid_ratio_derived_from_mask():
+    observation_space = _multimodal_space()
+    action_space = gymnasium.spaces.Box(-1, 1, shape=(2,))
+    policy = CNNGRUAttentionMLPPolicy(
+        observation_space=observation_space,
+        state_space=observation_space,
+        action_space=action_space,
+        device="cpu",
+        num_envs=2,
+        network=_multimodal_network(sequence_length=1),
+        reduction="sum",
+    )
+    identical_other = torch.tensor([[[1.0, -1.0]], [[1.0, -1.0]]])
+    native = {
+        "image": torch.zeros((2, 1, 3, 3)),
+        "ego": torch.zeros((2, 2)),
+        "other_0": identical_other.clone(),
+        "other_1": identical_other.clone(),
+        "others_mask": torch.tensor([[1.0, 0.0], [1.0, 1.0]]),
+    }
+    preprocessor = SelectiveRunningStandardScaler(
+        size=observation_space,
+        exclude_keys=["image", "others_mask"],
+        device="cpu",
+    )
+    observations = preprocessor(flatten_tensorized_space(native), train=True)
+    fusion_inputs = []
+    hook = policy.fusion_layer[0].register_forward_pre_hook(
+        lambda _module, args: fusion_inputs.append(args[0].detach().clone())
+    )
+    try:
+        policy.eval()
+        with torch.no_grad():
+            policy.compute({"observations": observations}, role="policy")
+    finally:
+        hook.remove()
+
+    assert len(fusion_inputs) == 1
+    torch.testing.assert_close(fusion_inputs[0][:, -1], torch.tensor([0.5, 1.0]))
+
+
 def test_actual_cnn_gru_attention_models_replay_t80_l40_async_done_exactly():
     """Integration oracle for the actual model classes used by the swarm config."""
 
