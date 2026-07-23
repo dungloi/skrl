@@ -146,7 +146,8 @@ def _normalize_cnn_cfg(raw_cfg: Any) -> dict[str, Any]:
         raw_cfg: 原始 `network.cnn` 配置。
 
     Returns:
-        标准化后的 CNN 配置，包含 tuple 化空间参数和 activation factory。
+        标准化后的 CNN 配置，包含 tuple 化空间参数、输出特征维度和
+        activation factory。
 
     Raises:
         ValueError: 当缺少必需字段、存在未知字段、或字段类型/形状非法时抛出。
@@ -156,7 +157,8 @@ def _normalize_cnn_cfg(raw_cfg: Any) -> dict[str, Any]:
         raise ValueError("Invalid `network.cnn` config: expected a mapping")
     # 先校验字段完整性与合法性，再做值校验
     required_keys = {"channels", "kernels", "strides", "paddings", "activation"}
-    _check_unknown_keys(raw_cfg, required_keys, "network.cnn")
+    allowed_keys = required_keys | {"output_dim"}
+    _check_unknown_keys(raw_cfg, allowed_keys, "network.cnn")
     missing_keys = sorted(required_keys - set(raw_cfg.keys()))
     if missing_keys:
         raise ValueError(f"Missing required `network.cnn` keys: {missing_keys}")
@@ -167,6 +169,7 @@ def _normalize_cnn_cfg(raw_cfg: Any) -> dict[str, Any]:
     strides = raw_cfg["strides"]
     paddings = raw_cfg["paddings"]
     activation = _normalize_activation_name(raw_cfg["activation"], "network.cnn.activation")
+    output_dim = raw_cfg.get("output_dim", 64)
 
     if not isinstance(channels, (list, tuple)) or len(channels) == 0:
         raise ValueError("Invalid `network.cnn.channels`: expected a non-empty list of positive integers")
@@ -176,6 +179,10 @@ def _normalize_cnn_cfg(raw_cfg: Any) -> dict[str, Any]:
         raise ValueError("Invalid `network.cnn`: `kernels`, `strides`, and `paddings` must be lists")
     if not all(isinstance(ch, int) and ch > 0 for ch in channels):
         raise ValueError("Invalid `network.cnn.channels`: all channel values must be positive integers")
+    if not isinstance(output_dim, int) or output_dim <= 0:
+        raise ValueError(
+            f"Invalid `network.cnn.output_dim`: expected a positive integer, got {output_dim}"
+        )
     if not all(isinstance(v, (int, list, tuple)) for v in list(kernels) + list(strides) + list(paddings)):
         raise ValueError("Invalid `network.cnn` shape fields: use int or [int, int] per layer")
 
@@ -191,6 +198,7 @@ def _normalize_cnn_cfg(raw_cfg: Any) -> dict[str, Any]:
         "kernels": [_to_2d_tuple(v, "network.cnn.kernels") for v in kernels],
         "strides": [_to_2d_tuple(v, "network.cnn.strides") for v in strides],
         "paddings": [_to_2d_tuple(v, "network.cnn.paddings") for v in paddings],
+        "output_dim": output_dim,
         "activation": activation,
         "activation_factory": _get_activation_factory(activation),
     }
@@ -230,14 +238,15 @@ def _normalize_attention_cfg(raw_cfg: Any) -> dict[str, int]:
     return {"embed_dim": embed_dim, "num_heads": num_heads}
 
 
-def _normalize_gru_cfg(raw_cfg: Any) -> dict[str, int]:
+def _normalize_gru_cfg(raw_cfg: Any) -> dict[str, Any]:
     """校验并标准化 GRU 配置。
 
     Args:
         raw_cfg: 原始 `network.gru` 配置。
 
     Returns:
-        标准化后的 GRU 配置，包含 `hidden_size`、`num_layers` 与 `sequence_length`。
+        标准化后的 GRU 配置，包含 `hidden_size`、`num_layers`、`sequence_length`
+        与可选的 `separate_feature_projection`。
 
     Raises:
         ValueError: 当缺少必需字段、存在未知字段、类型非法或数值非正时抛出。
@@ -248,7 +257,8 @@ def _normalize_gru_cfg(raw_cfg: Any) -> dict[str, int]:
 
     # 先校验字段完整性与合法性，再做值校验
     required_keys = {"hidden_size", "num_layers", "sequence_length"}
-    _check_unknown_keys(raw_cfg, required_keys, "network.gru")
+    allowed_keys = required_keys | {"separate_feature_projection"}
+    _check_unknown_keys(raw_cfg, allowed_keys, "network.gru")
     missing_keys = sorted(required_keys - set(raw_cfg.keys()))
     if missing_keys:
         raise ValueError(f"Missing required `network.gru` keys: {missing_keys}")
@@ -258,10 +268,17 @@ def _normalize_gru_cfg(raw_cfg: Any) -> dict[str, int]:
         "hidden_size": raw_cfg["hidden_size"],
         "num_layers": raw_cfg["num_layers"],
         "sequence_length": raw_cfg["sequence_length"],
+        "separate_feature_projection": raw_cfg.get("separate_feature_projection", False),
     }
-    for key, value in cfg.items():
+    for key in required_keys:
+        value = cfg[key]
         if not isinstance(value, int) or value <= 0:
             raise ValueError(f"Invalid `network.gru.{key}`: expected a positive integer, got {value}")
+    if not isinstance(cfg["separate_feature_projection"], bool):
+        raise ValueError(
+            "Invalid `network.gru.separate_feature_projection`: expected a boolean, "
+            f"got {cfg['separate_feature_projection']!r}"
+        )
     return cfg
 
 

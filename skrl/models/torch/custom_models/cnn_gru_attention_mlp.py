@@ -71,6 +71,27 @@ def _parse_other_shape(other_shape: tuple[int, ...]) -> tuple[int, int]:
     return history_length, other_input_dim
 
 
+def _allocate_proportional_dims(input_dims: tuple[int, ...], total_dim: int) -> tuple[int, ...]:
+    """按输入维度比例分配整数输出维度，并保证总和为 ``total_dim``。"""
+    if not input_dims or any(dim <= 0 for dim in input_dims):
+        raise ValueError(f"Input dimensions must be positive, got {input_dims}")
+    if total_dim < len(input_dims):
+        raise ValueError(
+            "GRU hidden_size must be at least the number of separate feature sources: "
+            f"hidden_size={total_dim}, sources={len(input_dims)}"
+        )
+
+    input_dim_sum = sum(input_dims)
+    # 每条支路先保留一个维度，余量按最大余数、再按输入顺序稳定分配。
+    distributable_dim = total_dim - len(input_dims)
+    base_dims = [1 + distributable_dim * dim // input_dim_sum for dim in input_dims]
+    remaining = total_dim - sum(base_dims)
+    remainders = [distributable_dim * dim % input_dim_sum for dim in input_dims]
+    for index in sorted(range(len(input_dims)), key=lambda i: (-remainders[i], i))[:remaining]:
+        base_dims[index] += 1
+    return tuple(base_dims)
+
+
 def _merge_done_flags(inputs: dict[str, Any]) -> torch.Tensor | None:
     """合并 recurrent 训练中使用的终止信号。"""
     terminated = inputs.get("terminated")
@@ -180,13 +201,34 @@ class _CNNGRUAttentionMLPCommon:
         self.sequence_length = gru_cfg["sequence_length"]
         self.num_layers = gru_cfg["num_layers"]
         self.hidden_size = gru_cfg["hidden_size"]
+        self.separate_feature_projection = gru_cfg["separate_feature_projection"]
 
-        # 3. 按配置构建 CNN
-        self.cnn = _build_cnn(in_channels, cnn_cfg)
+        # 3. 按配置构建 CNN backbone，并在保留空间布局的前提下压缩视觉特征
+        cnn_with_flatten = _build_cnn(in_channels, cnn_cfg)
+        cnn_modules = list(cnn_with_flatten.children())
+        if not cnn_modules or not isinstance(cnn_modules[-1], nn.Flatten):
+            raise RuntimeError(f"[{model_name}] CNN builder must end with nn.Flatten")
+        self.cnn = nn.Sequential(*cnn_modules[:-1])
         with torch.no_grad():
-            # 创建全0的 dummy 输入来推断 flatten 后的维度
+            # 创建全0的 dummy 输入来推断 backbone 输出的通道和空间尺寸
             dummy_img = torch.zeros((1, *image_shape))
-            cnn_out = self.cnn(dummy_img)
+            cnn_backbone_out = self.cnn(dummy_img)
+        if cnn_backbone_out.dim() != 4:
+            raise ValueError(
+                f"[{model_name}] Invalid CNN backbone output: expected a 4D tensor, "
+                f"got shape {tuple(cnn_backbone_out.shape)}"
+            )
+
+        cnn_projection_flat_dim = int(cnn_backbone_out[0].numel())
+        cnn_output_dim = cnn_cfg["output_dim"]
+        self.cnn_projection = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(cnn_projection_flat_dim, cnn_output_dim),
+            nn.LayerNorm(cnn_output_dim),
+            nn.ReLU(),
+        )
+        with torch.no_grad():
+            cnn_out = self.cnn_projection(cnn_backbone_out)
             cnn_out_dim = cnn_out.shape[1]
 
         # 4. 定义 GRU（用于处理融合后的跨时间步记忆）
@@ -222,21 +264,32 @@ class _CNNGRUAttentionMLPCommon:
             nn.ReLU(),
         )
 
-        # 7. 定义单步多模态融合层与 MLP 部分 (融合特征 -> GRU -> Action / Value)
+        # 7. 定义 GRU 输入映射与 MLP 部分。
         # 有 mask 的输入为每个 other history slice 额外拼接一个
         # valid_ratio。与 valid_count 信息等价，但固定在 [0, 1]，不依赖
         # 最大检测槽位数。无 mask 的旧模型保持原网络尺寸以兼容现有用途。
-        fusion_raw_dim = (
-            cnn_out_dim
-            + embed_dim
-            + embed_dim * self.other_history_length
-            + (self.other_history_length if self._has_others_mask else 0)
+        attention_output_dim = embed_dim * self.other_history_length
+        source_input_dims = (cnn_out_dim, embed_dim, attention_output_dim)
+        fusion_raw_dim = sum(source_input_dims) + (
+            self.other_history_length if self._has_others_mask else 0
         )
-        self.fusion_layer = nn.Sequential(
-            nn.Linear(fusion_raw_dim, self.hidden_size),
-            nn.LayerNorm(self.hidden_size),
-            nn.ReLU(),
-        )
+        self.separate_feature_projection_dims: tuple[int, ...] | None = None
+        if self.separate_feature_projection:
+            self.separate_feature_projection_dims = _allocate_proportional_dims(
+                source_input_dims, self.hidden_size
+            )
+            self.depth_projection = nn.Linear(cnn_out_dim, self.separate_feature_projection_dims[0])
+            self.ego_projection = nn.Linear(embed_dim, self.separate_feature_projection_dims[1])
+            self.others_projection = nn.Linear(
+                attention_output_dim, self.separate_feature_projection_dims[2]
+            )
+            self.fusion_layer = None
+        else:
+            self.fusion_layer = nn.Sequential(
+                nn.Linear(fusion_raw_dim, self.hidden_size),
+                nn.LayerNorm(self.hidden_size),
+                nn.ReLU(),
+            )
         fused_input_dim = self.hidden_size
         self.mlp = _build_mlp(
             input_dim=fused_input_dim,
@@ -250,10 +303,13 @@ class _CNNGRUAttentionMLPCommon:
         self._ego_shape = ego_shape
         self._other_shape = other_shape
         self._cnn_cfg = cnn_cfg
+        self._cnn_backbone_out_shape = tuple(cnn_backbone_out.shape[1:])
+        self._cnn_projection_flat_dim = cnn_projection_flat_dim
         self._attention_cfg = attention_cfg
         self._mlp_cfg = mlp_cfg
         self._gru_cfg = gru_cfg
         self._cnn_out_dim = cnn_out_dim
+        self._source_input_dims = source_input_dims
         self._fusion_raw_dim = fusion_raw_dim
         self._fused_input_dim = fused_input_dim
 
@@ -362,7 +418,7 @@ class _CNNGRUAttentionMLPCommon:
             )
 
         # 3. CNN 处理图像输入
-        img_features = self.cnn(img)
+        img_features = self.cnn_projection(self.cnn(img))
 
         # 4. 计算 "ego" 与 "other" 的 embedding
         ego_query = self.ego_query_embedding(ego)
@@ -408,12 +464,22 @@ class _CNNGRUAttentionMLPCommon:
             batch_size, -1
         )
 
-        # 6. 先融合单步多模态特征，再经 GRU 和 MLP 输出
-        fusion_features = [img_features, ego_fusion, attention_output]
-        if valid_ratio is not None:
-            fusion_features.append(valid_ratio.reshape(batch_size, -1))
-        fused_step_feature = torch.cat(fusion_features, dim=1)
-        fused_step_feature = self.fusion_layer(fused_step_feature)
+        # 6. 映射单步多模态特征，再经 GRU 和 MLP 输出。
+        # 开启独立投影时不跨来源 fusion；valid_ratio 保留在旧路径中以保持兼容。
+        if self.separate_feature_projection:
+            fused_step_feature = torch.cat(
+                [
+                    self.depth_projection(img_features),
+                    self.ego_projection(ego_fusion),
+                    self.others_projection(attention_output),
+                ],
+                dim=1,
+            )
+        else:
+            fusion_features = [img_features, ego_fusion, attention_output]
+            if valid_ratio is not None:
+                fusion_features.append(valid_ratio.reshape(batch_size, -1))
+            fused_step_feature = self.fusion_layer(torch.cat(fusion_features, dim=1))
         recurrent_feature, hidden_states = self._run_gru(fused_step_feature, inputs)
         return self.mlp(recurrent_feature), hidden_states
 
@@ -541,6 +607,7 @@ class CNNGRUAttentionMLPPolicy(_CNNGRUAttentionMLPCommon, GaussianMixin, Model):
                 ("kernels", self._cnn_cfg["kernels"]),
                 ("strides", self._cnn_cfg["strides"]),
                 ("paddings", self._cnn_cfg["paddings"]),
+                ("output_dim", self._cnn_cfg["output_dim"]),
                 ("activation", self._cnn_cfg["activation"]),
             ],
         )
@@ -557,6 +624,7 @@ class CNNGRUAttentionMLPPolicy(_CNNGRUAttentionMLPCommon, GaussianMixin, Model):
                 ("hidden_size", self._gru_cfg["hidden_size"]),
                 ("num_layers", self._gru_cfg["num_layers"]),
                 ("sequence_length", self._gru_cfg["sequence_length"]),
+                ("separate_feature_projection", self._gru_cfg["separate_feature_projection"]),
             ],
         )
         _print_subconfig(
@@ -569,8 +637,12 @@ class CNNGRUAttentionMLPPolicy(_CNNGRUAttentionMLPCommon, GaussianMixin, Model):
         )
 
         _print_section("Derived Dims")
+        _print_kv("cnn_backbone_out_shape", self._cnn_backbone_out_shape)
+        _print_kv("cnn_projection_flat_dim", self._cnn_projection_flat_dim)
         _print_kv("cnn_out_dim", self._cnn_out_dim)
+        _print_kv("gru_input_source_dims", self._source_input_dims)
         _print_kv("fusion_raw_dim", self._fusion_raw_dim)
+        _print_kv("separate_projection_dims", self.separate_feature_projection_dims)
         _print_kv("gru_hidden_size", self.hidden_size)
         _print_kv("fused_input_dim", self._fused_input_dim)
         _print_block_footer(f"[{self.__class__.__name__}] Ready")
@@ -684,6 +756,7 @@ class CNNGRUAttentionMLPValue(_CNNGRUAttentionMLPCommon, DeterministicMixin, Mod
                 ("kernels", self._cnn_cfg["kernels"]),
                 ("strides", self._cnn_cfg["strides"]),
                 ("paddings", self._cnn_cfg["paddings"]),
+                ("output_dim", self._cnn_cfg["output_dim"]),
                 ("activation", self._cnn_cfg["activation"]),
             ],
         )
@@ -700,6 +773,7 @@ class CNNGRUAttentionMLPValue(_CNNGRUAttentionMLPCommon, DeterministicMixin, Mod
                 ("hidden_size", self._gru_cfg["hidden_size"]),
                 ("num_layers", self._gru_cfg["num_layers"]),
                 ("sequence_length", self._gru_cfg["sequence_length"]),
+                ("separate_feature_projection", self._gru_cfg["separate_feature_projection"]),
             ],
         )
         _print_subconfig(
@@ -712,8 +786,12 @@ class CNNGRUAttentionMLPValue(_CNNGRUAttentionMLPCommon, DeterministicMixin, Mod
         )
 
         _print_section("Derived Dims")
+        _print_kv("cnn_backbone_out_shape", self._cnn_backbone_out_shape)
+        _print_kv("cnn_projection_flat_dim", self._cnn_projection_flat_dim)
         _print_kv("cnn_out_dim", self._cnn_out_dim)
+        _print_kv("gru_input_source_dims", self._source_input_dims)
         _print_kv("fusion_raw_dim", self._fusion_raw_dim)
+        _print_kv("separate_projection_dims", self.separate_feature_projection_dims)
         _print_kv("gru_hidden_size", self.hidden_size)
         _print_kv("fused_input_dim", self._fused_input_dim)
         _print_kv("output_dim", 1)

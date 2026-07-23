@@ -16,6 +16,7 @@ import gymnasium
 import pytest
 
 import torch
+import torch.nn as nn
 
 from skrl.agents.torch.ppo import PPO_RNN
 from skrl.memories.torch import RandomMemory
@@ -1477,6 +1478,44 @@ def test_attention_fusion_receives_valid_ratio_derived_from_mask():
     torch.testing.assert_close(fusion_inputs[0][:, -1], torch.tensor([0.5, 1.0]))
 
 
+def test_separate_feature_projection_bypasses_fusion_and_preserves_gru_input_size():
+    observation_space = _multimodal_space()
+    action_space = gymnasium.spaces.Box(-1, 1, shape=(2,))
+    network = _multimodal_network(sequence_length=1)
+    network["cnn"]["output_dim"] = 2
+    network["gru"]["hidden_size"] = 4
+    network["gru"]["separate_feature_projection"] = True
+    policy = CNNGRUAttentionMLPPolicy(
+        observation_space=observation_space,
+        state_space=observation_space,
+        action_space=action_space,
+        device="cpu",
+        num_envs=2,
+        network=network,
+        reduction="sum",
+    )
+
+    assert policy.fusion_layer is None
+    assert policy.separate_feature_projection_dims == (2, 1, 1)
+    assert sum(policy.separate_feature_projection_dims) == policy.hidden_size
+    assert policy.depth_projection.in_features == 2
+    assert policy.ego_projection.in_features == 2
+    assert policy.others_projection.in_features == 2
+
+    native = {
+        "image": torch.zeros((2, 1, 3, 3)),
+        "ego": torch.zeros((2, 2)),
+        "other_0": torch.zeros((2, 1, 2)),
+        "other_1": torch.zeros((2, 1, 2)),
+        "others_mask": torch.ones((2, 2)),
+    }
+    observations = flatten_tensorized_space(native)
+    policy.eval()
+    with torch.no_grad():
+        actions, _ = policy.compute({"observations": observations}, role="policy")
+    assert actions.shape == (2, 2)
+
+
 def test_actual_cnn_gru_attention_models_replay_t80_l40_async_done_exactly():
     """Integration oracle for the actual model classes used by the swarm config."""
 
@@ -1601,10 +1640,11 @@ def _deployment_multimodal_space() -> gymnasium.spaces.Dict:
 def _deployment_network() -> dict[str, Any]:
     return {
         "cnn": {
-            "channels": [16, 32, 32],
+            "channels": [6, 8, 8],
             "kernels": [[3, 3], [3, 3], [3, 3]],
             "strides": [[2, 2], [2, 2], [2, 2]],
             "paddings": [[1, 1], [1, 1], [0, 0]],
+            "output_dim": 48,
             "activation": "relu",
         },
         "attention": {"embed_dim": 64, "num_heads": 4},
@@ -1658,6 +1698,15 @@ def test_deployment_shape_full_ppo_rnn_update_smoke(record_property):
         network=network,
         clip_actions=False,
     )
+    for model in (policy, value):
+        assert model._cnn_backbone_out_shape == (8, 3, 3)
+        assert model._cnn_projection_flat_dim == 72
+        assert model._cnn_out_dim == 48
+        projection = model.cnn_projection
+        assert isinstance(projection[0], nn.Flatten)
+        assert isinstance(projection[1], nn.Linear)
+        assert projection[1].in_features == 72
+        assert projection[1].out_features == 48
     cfg = _agent_cfg(
         rollouts=rollouts,
         learning_epochs=5,
