@@ -157,9 +157,47 @@ class PPO_CFG(AgentCfg):
     mixed_precision: bool = False
     """Whether to enable automatic mixed precision for higher performance."""
 
+    value_mixed_precision: bool | None = None
+    """Whether to run the value network under automatic mixed precision.
+
+    If ``None``, inherit :attr:`mixed_precision`. Set this to ``False`` to keep
+    policy AMP enabled while evaluating and training the critic in full
+    precision. This is useful for recurrent or vision critics whose activations
+    can exceed the FP16 range before gradient scaling can intervene.
+    """
+
+    value_loss_guard: float = 0.0
+    """Open the critic circuit breaker when its unscaled, normalized-space MSE
+    reaches this value.
+
+    A non-positive value disables the guard. Once opened, value updates are
+    skipped for the remainder of the current PPO update while policy updates
+    continue. Return targets are standardized by the configured value
+    preprocessor before this threshold is applied.
+    """
+
+    value_prediction_guard: float = 0.0
+    """Open the critic circuit breaker when the maximum absolute normalized
+    value prediction reaches this value.
+
+    A non-positive value disables the guard.
+    """
+
+    value_lr_backoff_factor: float = 1.0
+    """Factor applied once to the value optimizer group's learning rate when
+    the critic circuit breaker opens.
+
+    Must be in ``(0, 1]``. A value of ``1`` disables learning-rate backoff.
+    """
+
+    value_lr_backoff_min: float = 0.0
+    """Lower bound for automatic value learning-rate backoff."""
+
     def expand(self) -> None:
         """Expand the configuration."""
         super().expand()
+        if self.value_mixed_precision is None:
+            self.value_mixed_precision = self.mixed_precision
         # learning rate
         if not isinstance(self.learning_rate, (tuple, list)):
             self.learning_rate = (self.learning_rate, self.learning_rate)

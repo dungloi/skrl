@@ -16,7 +16,11 @@ import torch
 
 from skrl import config
 from skrl.agents.torch.ppo import PPO, PPO_RNN
-from skrl.agents.torch.ppo._utils import require_finite, validate_scalar_output
+from skrl.agents.torch.ppo._utils import (
+    compute_value_loss_fp32,
+    require_finite,
+    validate_scalar_output,
+)
 from skrl.memories.torch import RandomMemory
 from skrl.models.torch import DeterministicMixin, GaussianMixin, Model
 
@@ -384,6 +388,62 @@ def test_separate_policy_and_value_learning_rates_control_their_own_sgd_deltas(a
         torch.testing.assert_close(actual_delta, expected_delta, rtol=4e-5, atol=4e-6)
 
 
+def test_value_loss_is_promoted_before_squaring_large_half_precision_residuals():
+    predicted = torch.tensor([[300.0]], dtype=torch.float16, requires_grad=True)
+    loss, unscaled_loss, clip_fraction = compute_value_loss_fp32(
+        predicted_values=predicted,
+        sampled_values=torch.zeros_like(predicted),
+        sampled_returns=torch.zeros_like(predicted),
+        value_clip=0.0,
+        value_loss_scale=1.0,
+    )
+
+    assert loss.dtype == torch.float32
+    assert torch.isfinite(loss)
+    assert unscaled_loss.item() == pytest.approx(90_000.0)
+    assert clip_fraction.item() == 0.0
+    loss.backward()
+    assert torch.isfinite(predicted.grad).all()
+
+
+@pytest.mark.parametrize("agent_class", [PPO, PPO_RNN], ids=["ppo", "ppo_rnn_feedforward"])
+def test_critic_guard_freezes_value_continues_policy_and_backs_off_value_lr(agent_class):
+    policy_lr, value_lr = 0.03, 0.08
+    agent = _make_agent(
+        agent_class,
+        cfg_overrides={
+            "learning_rate": (policy_lr, value_lr),
+            "learning_epochs": 2,
+            "mini_batches": 2,
+            "value_loss_guard": 1e-12,
+            "value_lr_backoff_factor": 0.5,
+            "value_lr_backoff_min": 1e-4,
+        },
+    )
+    _fixed_rollout(agent)
+    policy_before = [parameter.detach().clone() for parameter in agent.policy.parameters()]
+    value_before = [parameter.detach().clone() for parameter in agent.value.parameters()]
+
+    agent.enable_models_training_mode(True)
+    agent.update(timestep=ROLLOUTS - 1, timesteps=ROLLOUTS)
+
+    assert any(
+        not torch.equal(before, after)
+        for before, after in zip(policy_before, agent.policy.parameters())
+    )
+    assert all(
+        torch.equal(before, after)
+        for before, after in zip(value_before, agent.value.parameters())
+    )
+    assert agent.tracking_data["Optimization / Critic guard activations"][-1] == 1
+    assert agent.tracking_data["Optimization / Critic skipped minibatches"][-1] == 4
+    assert agent.tracking_data["Value / Maximum unscaled loss"][-1] > 0
+    assert [group["lr"] for group in agent.optimizer.param_groups] == pytest.approx(
+        [policy_lr, value_lr * 0.5]
+    )
+    assert agent.tracking_data["Learning / Value LR backoff ratio"][-1] == pytest.approx(0.5)
+
+
 @pytest.mark.parametrize("agent_class", [PPO, PPO_RNN], ids=["ppo", "ppo_rnn_feedforward"])
 @pytest.mark.parametrize("grad_norm_clip", [0.0, 0.5], ids=["measured", "clipped"])
 def test_nonfinite_gradient_fails_before_optimizer_can_corrupt_parameters(agent_class, grad_norm_clip):
@@ -508,6 +568,12 @@ def _override_id(overrides):
         {"ratio_clip": float("nan")},
         {"ratio_clip": float("inf")},
         {"value_clip": float("nan")},
+        {"value_mixed_precision": True},
+        {"value_loss_guard": -1.0},
+        {"value_prediction_guard": -1.0},
+        {"value_lr_backoff_factor": 0.0},
+        {"value_lr_backoff_factor": 1.01},
+        {"value_lr_backoff_min": -1.0},
         {"value_clip": float("inf")},
         {"kl_threshold": float("nan")},
         {"kl_threshold": float("inf")},

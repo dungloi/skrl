@@ -37,10 +37,12 @@ def validate_ppo_setup(*, name: str, cfg: Any, policy: Any, value: Any, memory: 
         value_ = getattr(cfg, field)
         if not isinstance(value_, int) or isinstance(value_, bool) or value_ < 0:
             raise ValueError(f"{name} {field} must be a non-negative integer, got {value_!r}")
-    for field in ("time_limit_bootstrap", "mixed_precision"):
+    for field in ("time_limit_bootstrap", "mixed_precision", "value_mixed_precision"):
         value_ = getattr(cfg, field)
         if not isinstance(value_, bool):
             raise ValueError(f"{name} {field} must be a boolean, got {value_!r}")
+    if cfg.value_mixed_precision and not cfg.mixed_precision:
+        raise ValueError(f"{name} value_mixed_precision requires mixed_precision")
 
     discount_factor = _finite_float(f"{name} discount_factor", cfg.discount_factor)
     lambda_ = _finite_float(f"{name} lambda_", cfg.lambda_)
@@ -60,6 +62,26 @@ def validate_ppo_setup(*, name: str, cfg: Any, policy: Any, value: Any, memory: 
     _finite_float(f"{name} grad_norm_clip", cfg.grad_norm_clip)
     if entropy_loss_scale < 0 or value_loss_scale < 0:
         raise ValueError(f"{name} loss scales must be non-negative")
+
+    value_loss_guard = _finite_float(f"{name} value_loss_guard", cfg.value_loss_guard)
+    value_prediction_guard = _finite_float(
+        f"{name} value_prediction_guard", cfg.value_prediction_guard
+    )
+    value_lr_backoff_factor = _finite_float(
+        f"{name} value_lr_backoff_factor", cfg.value_lr_backoff_factor
+    )
+    value_lr_backoff_min = _finite_float(
+        f"{name} value_lr_backoff_min", cfg.value_lr_backoff_min
+    )
+    if value_loss_guard < 0 or value_prediction_guard < 0 or value_lr_backoff_min < 0:
+        raise ValueError(f"{name} value guards and backoff minimum must be non-negative")
+    if not 0 < value_lr_backoff_factor <= 1:
+        raise ValueError(f"{name} value_lr_backoff_factor must be in (0, 1]")
+    if (
+        policy is value
+        and (value_loss_guard > 0 or value_prediction_guard > 0 or value_lr_backoff_factor < 1)
+    ):
+        raise ValueError(f"{name} critic circuit breaker requires separate policy and value models")
 
     if len(cfg.learning_rate) != 2:
         raise ValueError(f"{name} learning_rate must contain exactly policy and value rates")
@@ -157,6 +179,78 @@ def any_rank_true(value: torch.Tensor) -> bool:
     local_failure = value.bool().any().to(dtype=torch.int32)
     failed, _ = _any_rank_failed(local_failure, synchronize=True)
     return failed
+
+
+def compute_value_loss_fp32(
+    *,
+    predicted_values: torch.Tensor,
+    sampled_values: torch.Tensor,
+    sampled_returns: torch.Tensor,
+    value_clip: float,
+    value_loss_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute PPO's value objective in FP32, even when the model uses AMP.
+
+    Gradient scaling only protects the backward pass. Squaring a large FP16
+    residual can overflow during the forward loss computation, so the value
+    objective is deliberately promoted before subtraction and squaring.
+
+    :return: ``(scaled_loss, unscaled_loss, clip_fraction)``.
+    """
+
+    predicted_values_fp32 = predicted_values.float()
+    sampled_values_fp32 = sampled_values.float()
+    sampled_returns_fp32 = sampled_returns.float()
+    if value_clip > 0:
+        value_delta = predicted_values_fp32 - sampled_values_fp32
+        with torch.no_grad():
+            value_clip_fraction = (torch.abs(value_delta) > value_clip).float().mean()
+        predicted_values_clipped = sampled_values_fp32 + torch.clip(
+            value_delta, min=-value_clip, max=value_clip
+        )
+        value_error = (sampled_returns_fp32 - predicted_values_fp32).square()
+        value_error_clipped = (sampled_returns_fp32 - predicted_values_clipped).square()
+        unscaled_loss = torch.maximum(value_error, value_error_clipped).mean()
+    else:
+        value_clip_fraction = torch.zeros((), device=sampled_values.device)
+        unscaled_loss = (sampled_returns_fp32 - predicted_values_fp32).square().mean()
+    return value_loss_scale * unscaled_loss, unscaled_loss, value_clip_fraction
+
+
+def critic_guard_triggered(
+    *,
+    predicted_values: torch.Tensor,
+    unscaled_value_loss: torch.Tensor,
+    loss_threshold: float,
+    prediction_threshold: float,
+) -> bool:
+    """Return a distributed-consistent critic circuit-breaker decision."""
+
+    triggered = torch.zeros((), dtype=torch.bool, device=predicted_values.device)
+    if loss_threshold > 0:
+        triggered |= unscaled_value_loss.detach() >= loss_threshold
+    if prediction_threshold > 0:
+        triggered |= predicted_values.detach().float().abs().max() >= prediction_threshold
+    return any_rank_true(triggered)
+
+
+def backoff_value_learning_rate(
+    *,
+    optimizer: torch.optim.Optimizer,
+    scheduler: Any,
+    factor: float,
+    minimum: float,
+) -> tuple[float, float]:
+    """Back off the value parameter group's learning rate once."""
+
+    group_index = 1 if len(optimizer.param_groups) > 1 else 0
+    group = optimizer.param_groups[group_index]
+    previous = float(group["lr"])
+    current = min(previous, max(previous * factor, minimum))
+    group["lr"] = current
+    if scheduler is not None and hasattr(scheduler, "_last_lr"):
+        scheduler._last_lr = [float(item["lr"]) for item in optimizer.param_groups]
+    return previous, current
 
 
 def validate_scalar_output(

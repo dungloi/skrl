@@ -8,7 +8,6 @@ from packaging import version
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from skrl import config, logger
 from skrl.agents.torch import Agent
@@ -20,6 +19,9 @@ from skrl.utils import ScopedTimer
 from .ppo_cfg import PPO_CFG
 from ._utils import (
     any_rank_true,
+    backoff_value_learning_rate,
+    compute_value_loss_fp32,
+    critic_guard_triggered,
     ensure_full_rollout,
     require_finite,
     require_finite_model,
@@ -469,7 +471,7 @@ class PPO_RNN(Agent):
                 rewards = self.cfg.rewards_shaper(rewards, timestep, timesteps)
 
             # compute values
-            with torch.autocast(device_type=self._device_type, enabled=self.cfg.mixed_precision):
+            with torch.autocast(device_type=self._device_type, enabled=self.cfg.value_mixed_precision):
                 inputs = {
                     "observations": self._observation_preprocessor(observations),
                     "states": self._state_preprocessor(states),
@@ -506,7 +508,7 @@ class PPO_RNN(Agent):
                         "PPO_RNN time-limit bootstrapping requires final pre-reset observations/states, "
                         "but this auto-reset environment only returned reset observations"
                     )
-                with torch.autocast(device_type=self._device_type, enabled=self.cfg.mixed_precision):
+                with torch.autocast(device_type=self._device_type, enabled=self.cfg.value_mixed_precision):
                     next_inputs = {
                         "observations": self._observation_preprocessor(next_observations),
                         "states": self._state_preprocessor(next_states),
@@ -630,7 +632,9 @@ class PPO_RNN(Agent):
             require_finite("PPO_RNN next states", self._current_next_states, synchronize=True)
 
         # compute returns and advantages
-        with torch.no_grad(), torch.autocast(device_type=self._device_type, enabled=self.cfg.mixed_precision):
+        with torch.no_grad(), torch.autocast(
+            device_type=self._device_type, enabled=self.cfg.value_mixed_precision
+        ):
             inputs = {
                 "observations": self._observation_preprocessor(self._current_next_observations),
                 "states": self._state_preprocessor(self._current_next_states),
@@ -740,6 +744,12 @@ class PPO_RNN(Agent):
         update_early_stop = False
         optimizer_steps = 0
         initial_replay_max_abs_log_ratio = 0.0
+        critic_guard_open = False
+        critic_guard_activations = 0
+        critic_skipped_minibatches = 0
+        value_effective_minibatches = 0
+        maximum_unscaled_value_loss = 0.0
+        maximum_abs_value_prediction = 0.0
 
         # learning epochs
         for epoch in range(self.cfg.learning_epochs):
@@ -866,42 +876,69 @@ class PPO_RNN(Agent):
 
                     policy_loss = -torch.min(surrogate, surrogate_clipped).mean()
 
-                    # compute value loss
-                    predicted_values_raw, _ = self.value.act({**inputs, **rnn_value}, role="value")
-                    validate_scalar_output(
-                        "PPO_RNN replay value",
-                        predicted_values_raw,
-                        sampled_returns.shape[0],
-                        synchronize=True,
-                    )
-
-                    with torch.no_grad():
-                        returns_detached = sampled_returns.detach().float()
-                        predicted_values_detached = predicted_values_raw.detach().float()
-                        residual_detached = returns_detached - predicted_values_detached
-                        explained_variance_batch_samples = returns_detached.numel()
-                        explained_variance_returns_sum += returns_detached.sum().item()
-                        explained_variance_returns_sumsq += returns_detached.pow(2).sum().item()
-                        explained_variance_residual_sum += residual_detached.sum().item()
-                        explained_variance_residual_sumsq += residual_detached.pow(2).sum().item()
-
-                    if self.cfg.value_clip > 0:
-                        value_delta = predicted_values_raw - sampled_values
-                        with torch.no_grad():
-                            value_clip_fraction = (torch.abs(value_delta) > self.cfg.value_clip).float().mean()
-                        predicted_values_clipped = sampled_values + torch.clip(
-                            value_delta, min=-self.cfg.value_clip, max=self.cfg.value_clip
-                        )
-                        value_error = (sampled_returns - predicted_values_raw).pow(2)
-                        value_error_clipped = (sampled_returns - predicted_values_clipped).pow(2)
-                        value_loss = self.cfg.value_loss_scale * torch.maximum(
-                            value_error, value_error_clipped
-                        ).mean()
-                    else:
+                    # Compute the critic independently from policy AMP. Once its
+                    # circuit breaker opens, keep training the actor but freeze
+                    # the critic for the rest of this PPO update.
+                    if critic_guard_open:
+                        critic_skipped_minibatches += 1
                         value_clip_fraction = torch.zeros((), device=sampled_values.device)
-                        value_loss = self.cfg.value_loss_scale * F.mse_loss(
-                            sampled_returns, predicted_values_raw
+                        value_loss = torch.zeros((), device=policy_loss.device)
+                        explained_variance_batch_samples = 0
+                    else:
+                        with torch.autocast(
+                            device_type=self._device_type,
+                            enabled=self.cfg.value_mixed_precision,
+                        ):
+                            predicted_values_raw, _ = self.value.act(
+                                {**inputs, **rnn_value}, role="value"
+                            )
+                        validate_scalar_output(
+                            "PPO_RNN replay value",
+                            predicted_values_raw,
+                            sampled_returns.shape[0],
+                            synchronize=True,
                         )
+                        value_loss, unscaled_value_loss, value_clip_fraction = compute_value_loss_fp32(
+                            predicted_values=predicted_values_raw,
+                            sampled_values=sampled_values,
+                            sampled_returns=sampled_returns,
+                            value_clip=self.cfg.value_clip,
+                            value_loss_scale=self.cfg.value_loss_scale,
+                        )
+
+                        with torch.no_grad():
+                            returns_detached = sampled_returns.detach().float()
+                            predicted_values_detached = predicted_values_raw.detach().float()
+                            residual_detached = returns_detached - predicted_values_detached
+                            explained_variance_batch_samples = returns_detached.numel()
+                            maximum_unscaled_value_loss = max(
+                                maximum_unscaled_value_loss, unscaled_value_loss.item()
+                            )
+                            maximum_abs_value_prediction = max(
+                                maximum_abs_value_prediction,
+                                predicted_values_detached.abs().max().item(),
+                            )
+
+                        if (
+                            self.cfg.value_loss_guard > 0 or self.cfg.value_prediction_guard > 0
+                        ) and critic_guard_triggered(
+                            predicted_values=predicted_values_raw,
+                            unscaled_value_loss=unscaled_value_loss,
+                            loss_threshold=self.cfg.value_loss_guard,
+                            prediction_threshold=self.cfg.value_prediction_guard,
+                        ):
+                            critic_guard_open = True
+                            critic_guard_activations += 1
+                            critic_skipped_minibatches += 1
+                            value_loss = torch.zeros((), device=policy_loss.device)
+                            value_clip_fraction = torch.zeros((), device=sampled_values.device)
+                            explained_variance_batch_samples = 0
+                        else:
+                            value_effective_minibatches += 1
+                            explained_variance_returns_sum += returns_detached.sum().item()
+                            explained_variance_returns_sumsq += returns_detached.pow(2).sum().item()
+                            explained_variance_residual_sum += residual_detached.sum().item()
+                            explained_variance_residual_sumsq += residual_detached.pow(2).sum().item()
 
                     total_loss = policy_loss + entropy_loss + value_loss
                     require_finite("PPO_RNN loss", total_loss, synchronize=True)
@@ -912,7 +949,7 @@ class PPO_RNN(Agent):
 
                 if config.torch.is_distributed:
                     self.policy.reduce_parameters()
-                    if self.policy is not self.value:
+                    if self.policy is not self.value and value_loss.requires_grad:
                         self.value.reduce_parameters()
 
                 self.scaler.unscale_(self.optimizer)
@@ -987,6 +1024,23 @@ class PPO_RNN(Agent):
             if update_early_stop:
                 break
 
+        value_lr_before_backoff = self.optimizer.param_groups[-1]["lr"]
+        value_lr_after_backoff = value_lr_before_backoff
+        if critic_guard_open:
+            value_lr_before_backoff, value_lr_after_backoff = backoff_value_learning_rate(
+                optimizer=self.optimizer,
+                scheduler=self.scheduler,
+                factor=self.cfg.value_lr_backoff_factor,
+                minimum=self.cfg.value_lr_backoff_min,
+            )
+            logger.warning(
+                "PPO_RNN critic circuit breaker opened: "
+                f"max unscaled value loss={maximum_unscaled_value_loss:.6g}, "
+                f"max abs prediction={maximum_abs_value_prediction:.6g}, "
+                f"skipped minibatches={critic_skipped_minibatches}, "
+                f"value lr={value_lr_before_backoff:.6g}->{value_lr_after_backoff:.6g}"
+            )
+
         # Keep input normalization fixed from rollout collection through optimization. Only after
         # the update is complete, absorb each rollout sample once for use by the next rollout.
         del inputs
@@ -1040,7 +1094,7 @@ class PPO_RNN(Agent):
         effective_samples_safe = max(effective_samples, 1)
         entropy_samples_safe = max(entropy_samples, 1)
         self.track_data("Loss / Policy loss", cumulative_policy_loss / effective_minibatches_safe)
-        self.track_data("Loss / Value loss", cumulative_value_loss / effective_minibatches_safe)
+        self.track_data("Loss / Value loss", cumulative_value_loss / max(value_effective_minibatches, 1))
         if self.cfg.entropy_loss_scale:
             self.track_data("Loss / Entropy loss", cumulative_entropy_loss / effective_minibatches_safe)
 
@@ -1084,7 +1138,15 @@ class PPO_RNN(Agent):
         self.track_data("Optimization / Successful optimizer steps", optimizer_steps)
         self.track_data("Optimization / Observed samples", observed_samples)
         self.track_data("Optimization / Effective samples", effective_samples)
+        self.track_data("Optimization / Critic guard activations", critic_guard_activations)
+        self.track_data("Optimization / Critic skipped minibatches", critic_skipped_minibatches)
         self.track_data("Policy / Initial replay max abs log-ratio", initial_replay_max_abs_log_ratio)
+        self.track_data("Value / Maximum unscaled loss", maximum_unscaled_value_loss)
+        self.track_data("Value / Maximum abs prediction", maximum_abs_value_prediction)
+        self.track_data(
+            "Learning / Value LR backoff ratio",
+            value_lr_after_backoff / value_lr_before_backoff if value_lr_before_backoff else 1.0,
+        )
 
         for name, preprocessor in (
             ("Observation", self._observation_preprocessor),
