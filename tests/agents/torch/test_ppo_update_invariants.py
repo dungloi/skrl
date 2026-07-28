@@ -1,12 +1,14 @@
-import pytest
-
+import datetime
 from unittest.mock import Mock
+
 import gymnasium
+import pytest
 
 import torch
 
 from skrl import config
 from skrl.agents.torch.ppo import PPO, PPO_RNN
+from skrl.agents.torch.ppo._utils import synchronized_grad_scaler_step
 from skrl.memories.torch import RandomMemory
 from skrl.models.torch import DeterministicMixin, GaussianMixin, Model
 from skrl.resources.preprocessors.torch import RunningStandardScaler, SelectiveRunningStandardScaler
@@ -80,13 +82,13 @@ def _tiny_recurrence(model, x, hidden):
 
 
 class TinyRecurrentPolicy(GaussianMixin, Model):
-    def __init__(self, observation_space, state_space, action_space):
+    def __init__(self, observation_space, state_space, action_space, device="cpu"):
         Model.__init__(
             self,
             observation_space=observation_space,
             state_space=state_space,
             action_space=action_space,
-            device="cpu",
+            device=device,
         )
         GaussianMixin.__init__(self, reduction="sum")
         self.gain = torch.nn.Parameter(torch.ones(1))
@@ -101,13 +103,13 @@ class TinyRecurrentPolicy(GaussianMixin, Model):
 
 
 class TinyRecurrentValue(DeterministicMixin, Model):
-    def __init__(self, observation_space, state_space, action_space):
+    def __init__(self, observation_space, state_space, action_space, device="cpu"):
         Model.__init__(
             self,
             observation_space=observation_space,
             state_space=state_space,
             action_space=action_space,
-            device="cpu",
+            device=device,
         )
         DeterministicMixin.__init__(self)
         self.gain = torch.nn.Parameter(torch.tensor([0.25]))
@@ -171,6 +173,8 @@ def _make_agent(
     input_preprocessor=RecordingRunningStandardScaler,
     rollouts=4,
     mini_batches=2,
+    device="cpu",
+    mixed_precision=False,
 ):
     torch.manual_seed(0)
 
@@ -179,14 +183,14 @@ def _make_agent(
     action_space = gymnasium.spaces.Box(low=-1, high=1, shape=(1,))
 
     if recurrent:
-        policy = TinyRecurrentPolicy(observation_space, state_space, action_space)
-        value = TinyRecurrentValue(observation_space, state_space, action_space)
+        policy = TinyRecurrentPolicy(observation_space, state_space, action_space, device=device)
+        value = TinyRecurrentValue(observation_space, state_space, action_space, device=device)
     else:
         policy = gaussian_model(
             observation_space=observation_space,
             state_space=state_space,
             action_space=action_space,
-            device="cpu",
+            device=device,
             network=[{"name": "net", "input": "OBSERVATIONS", "layers": [8], "activations": "tanh"}],
             output="ACTIONS",
         )
@@ -194,11 +198,11 @@ def _make_agent(
             observation_space=observation_space,
             state_space=state_space,
             action_space=action_space,
-            device="cpu",
+            device=device,
             network=[{"name": "net", "input": "STATES", "layers": [8], "activations": "tanh"}],
             output="ONE",
         )
-    memory = RandomMemory(memory_size=rollouts, num_envs=1, device="cpu")
+    memory = RandomMemory(memory_size=rollouts, num_envs=1, device=device)
     cfg = {
         "rollouts": rollouts,
         "learning_epochs": learning_epochs,
@@ -209,11 +213,11 @@ def _make_agent(
         "observation_preprocessor": input_preprocessor,
         "observation_preprocessor_kwargs": {
             "size": observation_space,
-            "device": "cpu",
+            "device": device,
             "clip_threshold": 100.0,
         },
         "state_preprocessor": input_preprocessor,
-        "state_preprocessor_kwargs": {"size": state_space, "device": "cpu", "clip_threshold": 100.0},
+        "state_preprocessor_kwargs": {"size": state_space, "device": device, "clip_threshold": 100.0},
         "value_preprocessor": None,
         "random_timesteps": 0,
         "learning_starts": 0,
@@ -223,7 +227,7 @@ def _make_agent(
         "entropy_loss_scale": 0.0,
         "value_loss_scale": 0.5,
         "kl_threshold": kl_threshold,
-        "mixed_precision": False,
+        "mixed_precision": mixed_precision,
         "experiment": {
             "directory": "",
             "experiment_name": "",
@@ -240,7 +244,7 @@ def _make_agent(
         observation_space=observation_space,
         state_space=state_space,
         action_space=action_space,
-        device="cpu",
+        device=device,
         cfg=cfg,
     )
     agent.init()
@@ -248,7 +252,10 @@ def _make_agent(
 
 
 def _collect_rollout(agent, sample_count=4):
-    observations = torch.tensor([[1.0, -1.5], [2.0, -0.5], [3.0, 0.5], [4.0, 1.5], [5.0, 2.5], [6.0, 3.5]])
+    observations = torch.tensor(
+        [[1.0, -1.5], [2.0, -0.5], [3.0, 0.5], [4.0, 1.5], [5.0, 2.5], [6.0, 3.5]],
+        device=agent.device,
+    )
     states = torch.tensor(
         [
             [-2.0, 0.0, 2.0],
@@ -257,7 +264,8 @@ def _collect_rollout(agent, sample_count=4):
             [1.0, 3.0, 5.0],
             [2.0, 4.0, 6.0],
             [3.0, 5.0, 7.0],
-        ]
+        ],
+        device=agent.device,
     )
     observations = observations[:sample_count]
     states = states[:sample_count]
@@ -270,11 +278,11 @@ def _collect_rollout(agent, sample_count=4):
                 observations=observation,
                 states=state,
                 actions=actions,
-                rewards=torch.zeros((1, 1)),
+                rewards=torch.zeros((1, 1), device=agent.device),
                 next_observations=observation + 0.25,
                 next_states=state + 0.25,
-                terminated=torch.zeros((1, 1), dtype=torch.bool),
-                truncated=torch.zeros((1, 1), dtype=torch.bool),
+                terminated=torch.zeros((1, 1), dtype=torch.bool, device=agent.device),
+                truncated=torch.zeros((1, 1), dtype=torch.bool, device=agent.device),
                 infos={},
                 timestep=timestep,
                 timesteps=sample_count,
@@ -545,3 +553,321 @@ def test_scheduler_does_not_advance_when_grad_scaler_skips_all_optimizer_steps(a
     parameters_after = [parameter for model in (agent.policy, agent.value) for parameter in model.parameters()]
     assert all(torch.equal(before, after) for before, after in zip(parameters_before, parameters_after))
     assert scheduler_step.call_count == 0
+
+
+def test_grad_scaler_gates_an_overflow_created_while_unscaling():
+    """A scale below one can turn a finite scaled gradient into Inf during unscale_."""
+
+    parameter = torch.nn.Parameter(torch.zeros(1))
+    optimizer = torch.optim.SGD((parameter,), lr=1.0)
+    scaler = torch.amp.GradScaler(device="cpu", init_scale=0.5, enabled=True)
+    scaler.scale(parameter.sum())  # lazily initialize the scale tensor
+    parameter.grad = torch.full_like(parameter, torch.finfo(parameter.dtype).max)
+    scaler.unscale_(optimizer)
+    assert torch.isinf(parameter.grad).all()
+
+    scale_before = scaler.get_scale()
+    optimizer_step_succeeded = synchronized_grad_scaler_step(
+        scaler=scaler, optimizer=optimizer, grad_norm=parameter.grad.norm()
+    )
+
+    assert not optimizer_step_succeeded
+    assert torch.equal(parameter, torch.zeros_like(parameter))
+    assert scaler.get_scale() == pytest.approx(scale_before * 0.5)
+
+
+def test_distributed_grad_scaler_scale_mismatch_fails_before_optimizer_step(monkeypatch):
+    parameter = torch.nn.Parameter(torch.ones(1))
+    optimizer = torch.optim.SGD((parameter,), lr=1.0)
+    scaler = torch.amp.GradScaler(device="cpu", init_scale=8.0, enabled=True)
+    scaler.scale(parameter.square().sum()).backward()
+    scaler.unscale_(optimizer)
+    parameter_before = parameter.detach().clone()
+
+    monkeypatch.setattr(config.torch, "_is_distributed", True)
+
+    def emulate_smaller_remote_scale(step_control, op):
+        assert op == torch.distributed.ReduceOp.MIN
+        # Local scale is 8. The combined MIN reduction for a remote scale of 4 has
+        # min(scale)=4 and min(-scale)=-8, exposing the mismatch on every rank.
+        step_control[2] = 4.0
+        step_control[3] = -8.0
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", emulate_smaller_remote_scale)
+    with pytest.raises(RuntimeError, match="scale differs across distributed ranks"):
+        synchronized_grad_scaler_step(
+            scaler=scaler, optimizer=optimizer, grad_norm=parameter.grad.norm()
+        )
+
+    assert torch.equal(parameter, parameter_before)
+    assert scaler.get_scale() == 8.0
+    assert not optimizer.state
+
+
+@pytest.mark.parametrize(
+    ("agent_class", "recurrent"),
+    [(PPO, False), (PPO_RNN, True)],
+    ids=["ppo", "ppo-rnn"],
+)
+def test_remote_amp_overflow_is_synchronized_before_any_optimizer_step(
+    agent_class, recurrent, monkeypatch
+):
+    """A remote-only overflow must skip parameters, scaler growth and scheduler on this rank."""
+
+    agent = _make_agent(
+        agent_class,
+        learning_epochs=1,
+        learning_rate=1e-3,
+        recurrent=recurrent,
+        mixed_precision=True,
+    )
+    _collect_rollout(agent)
+    parameters_before = [
+        parameter.detach().clone() for model in (agent.policy, agent.value) for parameter in model.parameters()
+    ]
+    scale_before = agent.scaler.get_scale()
+    agent.scheduler = torch.optim.lr_scheduler.ConstantLR(agent.optimizer, factor=0.5, total_iters=5)
+    scheduler_step = Mock(wraps=agent.scheduler.step)
+    agent.scheduler.step = scheduler_step
+
+    # Gradient reduction itself is outside this control-flow test. Simulate an otherwise
+    # identical remote worker whose post-unscale finite flag is false on every minibatch.
+    agent.policy.reduce_parameters = Mock()
+    agent.value.reduce_parameters = Mock()
+    monkeypatch.setattr(config.torch, "_is_distributed", True)
+    monkeypatch.setattr(config.torch, "_world_size", 2)
+    min_reductions = 0
+
+    def emulate_remote_overflow(tensor, op):
+        nonlocal min_reductions
+        if op == torch.distributed.ReduceOp.MIN:
+            min_reductions += 1
+            tensor[0] = 0
+        elif op == torch.distributed.ReduceOp.SUM:
+            # End-of-update scaler moments see an identical remote rollout.
+            tensor.mul_(2)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", emulate_remote_overflow)
+    agent.enable_models_training_mode(True)
+    agent.update(timestep=3, timesteps=4)
+
+    parameters_after = [parameter for model in (agent.policy, agent.value) for parameter in model.parameters()]
+    assert all(torch.equal(before, after) for before, after in zip(parameters_before, parameters_after))
+    assert min_reductions == 2
+    assert agent.scaler.get_scale() == pytest.approx(scale_before * (0.5**min_reductions))
+    assert agent.tracking_data["Optimization / Gradient overflow count"][-1] == min_reductions
+    assert agent.tracking_data["Optimization / Successful optimizer steps"][-1] == 0
+    assert scheduler_step.call_count == 0
+
+
+def _run_two_rank_amp_overflow_update(rank, world_size, init_method):
+    torch.distributed.init_process_group(
+        backend="gloo",
+        init_method=init_method,
+        rank=rank,
+        world_size=world_size,
+        timeout=datetime.timedelta(seconds=30),
+    )
+    previous_distributed = config.torch._is_distributed
+    previous_world_size = config.torch._world_size
+    previous_rank = config.torch._rank
+    previous_local_rank = config.torch._local_rank
+    config.torch._is_distributed = True
+    config.torch._world_size = world_size
+    config.torch._rank = rank
+    config.torch._local_rank = rank
+
+    try:
+        agent = _make_agent(
+            PPO,
+            learning_epochs=1,
+            learning_rate=1e-3,
+            mixed_precision=True,
+        )
+        _collect_rollout(agent)
+        parameters_before = [
+            parameter.detach().clone()
+            for model in (agent.policy, agent.value)
+            for parameter in model.parameters()
+        ]
+        scale_before = agent.scaler.get_scale()
+        agent.scheduler = torch.optim.lr_scheduler.ConstantLR(
+            agent.optimizer, factor=0.5, total_iters=5
+        )
+        scheduler_epoch_before = agent.scheduler.last_epoch
+
+        # PPO has already reduced the scaled gradients when it calls unscale_. Inject a
+        # rank-local overflow at that boundary to exercise the exact case in which a
+        # post-step success reduction would be too late: rank 0 is ready to step while
+        # rank 1's GradScaler must skip.
+        original_unscale = agent.scaler.unscale_
+
+        def unscale_with_rank_local_overflow(optimizer):
+            if rank == 1 and optimizer is agent.optimizer:
+                parameter_with_gradient = next(
+                    parameter
+                    for group in optimizer.param_groups
+                    for parameter in group["params"]
+                    if parameter.grad is not None
+                )
+                parameter_with_gradient.grad.fill_(float("inf"))
+            return original_unscale(optimizer)
+
+        agent.scaler.unscale_ = unscale_with_rank_local_overflow
+        agent.enable_models_training_mode(True)
+        agent.update(timestep=3, timesteps=4)
+
+        parameters_after = [
+            parameter.detach()
+            for model in (agent.policy, agent.value)
+            for parameter in model.parameters()
+        ]
+        assert all(
+            torch.equal(before, after)
+            for before, after in zip(parameters_before, parameters_after)
+        )
+        assert agent.scaler.get_scale() == pytest.approx(scale_before * 0.25)
+        assert agent.tracking_data["Optimization / Gradient overflow count"][-1] == 2
+        assert agent.tracking_data["Optimization / Successful optimizer steps"][-1] == 0
+        assert agent.scheduler.last_epoch == scheduler_epoch_before
+        assert not agent.optimizer.state
+
+        # Verify the final state across the real process group, not only against each
+        # worker's local snapshot.
+        flattened_parameters = torch.cat([parameter.flatten() for parameter in parameters_after])
+        gathered_parameters = [
+            torch.empty_like(flattened_parameters) for _ in range(world_size)
+        ]
+        torch.distributed.all_gather(gathered_parameters, flattened_parameters)
+        assert all(
+            torch.equal(gathered_parameters[0], parameters)
+            for parameters in gathered_parameters[1:]
+        )
+
+        local_step_state = torch.tensor(
+            [
+                agent.scaler.get_scale(),
+                agent.tracking_data["Optimization / Gradient overflow count"][-1],
+                agent.tracking_data["Optimization / Successful optimizer steps"][-1],
+            ],
+            dtype=torch.float64,
+        )
+        gathered_step_states = [
+            torch.empty_like(local_step_state) for _ in range(world_size)
+        ]
+        torch.distributed.all_gather(gathered_step_states, local_step_state)
+        assert all(
+            torch.equal(gathered_step_states[0], step_state)
+            for step_state in gathered_step_states[1:]
+        )
+    finally:
+        config.torch._is_distributed = previous_distributed
+        config.torch._world_size = previous_world_size
+        config.torch._rank = previous_rank
+        config.torch._local_rank = previous_local_rank
+        torch.distributed.destroy_process_group()
+
+
+def test_two_rank_amp_overflow_skips_all_optimizer_steps_and_synchronizes_scalers(
+    tmp_path,
+):
+    if not torch.distributed.is_available() or not torch.distributed.is_gloo_available():
+        pytest.skip("PyTorch Gloo distributed backend is not available")
+    if torch.distributed.is_initialized():
+        pytest.skip("The parent pytest process already owns a distributed process group")
+
+    world_size = 2
+    torch.multiprocessing.spawn(
+        _run_two_rank_amp_overflow_update,
+        args=(world_size, (tmp_path / "two_rank_amp_init").as_uri()),
+        nprocs=world_size,
+        join=True,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.parametrize(
+    ("agent_class", "recurrent"),
+    [(PPO, False), (PPO_RNN, True)],
+    ids=["ppo", "ppo-rnn"],
+)
+def test_cuda_amp_overflow_skips_parameters_scaler_and_scheduler_steps(agent_class, recurrent):
+    """Exercise real CUDA GradScaler overflow handling with a finite PPO loss."""
+
+    agent = _make_agent(
+        agent_class,
+        learning_epochs=1,
+        learning_rate=1e-3,
+        recurrent=recurrent,
+        device="cuda:0",
+        mixed_precision=True,
+    )
+    _collect_rollout(agent)
+
+    assert agent.scaler.is_enabled()
+    parameters_before = [
+        parameter.detach().clone() for model in (agent.policy, agent.value) for parameter in model.parameters()
+    ]
+    scale_before = agent.scaler.get_scale()
+    agent.scheduler = torch.optim.lr_scheduler.ConstantLR(agent.optimizer, factor=0.5, total_iters=5)
+    scheduler_epoch_before = agent.scheduler.last_epoch
+    scheduler_step = Mock(wraps=agent.scheduler.step)
+    agent.scheduler.step = scheduler_step
+
+    # The hook runs during backward, after the finite-loss guard and before GradScaler.unscale_.
+    # One non-finite gradient must make GradScaler skip the complete optimizer transaction.
+    hooked_parameter = next(parameter for parameter in agent.policy.parameters() if parameter.requires_grad)
+    gradient_hook = hooked_parameter.register_hook(lambda gradient: torch.full_like(gradient, float("inf")))
+    try:
+        agent.enable_models_training_mode(True)
+        agent.update(timestep=3, timesteps=4)
+    finally:
+        gradient_hook.remove()
+
+    expected_overflows = 2  # one for each complete minibatch in the single learning epoch
+    parameters_after = [parameter for model in (agent.policy, agent.value) for parameter in model.parameters()]
+    assert all(torch.equal(before, after) for before, after in zip(parameters_before, parameters_after))
+    assert agent.scaler.get_scale() == pytest.approx(scale_before * (0.5**expected_overflows))
+    assert agent.tracking_data["Optimization / Gradient overflow count"][-1] == expected_overflows
+    assert agent.tracking_data["Optimization / Successful optimizer steps"][-1] == 0
+    assert agent.tracking_data["Optimization / Effective minibatches"][-1] == expected_overflows
+    assert agent.tracking_data["Optimization / Grad norm"][-1] == 0.0
+    assert scheduler_step.call_count == 0
+    assert agent.scheduler.last_epoch == scheduler_epoch_before
+    assert not agent.optimizer.state
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+def test_cuda_amp_ppo_executes_real_mixed_precision_optimizer_steps():
+    """Smoke-test the successful CUDA autocast/GradScaler path for feed-forward PPO."""
+
+    agent = _make_agent(
+        PPO,
+        learning_epochs=1,
+        learning_rate=1e-3,
+        device="cuda:0",
+        mixed_precision=True,
+    )
+    # Avoid making this success-path smoke depend on GradScaler's initial overflow calibration.
+    agent.scaler = torch.amp.GradScaler(device="cuda", init_scale=128.0, growth_interval=1000, enabled=True)
+    _collect_rollout(agent)
+
+    parameters_before = [
+        parameter.detach().clone() for model in (agent.policy, agent.value) for parameter in model.parameters()
+    ]
+    scale_before = agent.scaler.get_scale()
+    agent.scheduler = torch.optim.lr_scheduler.ConstantLR(agent.optimizer, factor=0.5, total_iters=5)
+    scheduler_step = Mock(wraps=agent.scheduler.step)
+    agent.scheduler.step = scheduler_step
+    agent.enable_models_training_mode(True)
+    agent.update(timestep=3, timesteps=4)
+
+    parameters_after = [parameter for model in (agent.policy, agent.value) for parameter in model.parameters()]
+    assert any(not torch.equal(before, after) for before, after in zip(parameters_before, parameters_after))
+    assert all(torch.isfinite(parameter).all() for parameter in parameters_after)
+    assert agent.scaler.is_enabled()
+    assert agent.scaler.get_scale() == scale_before
+    assert agent.tracking_data["Optimization / Gradient overflow count"][-1] == 0
+    assert agent.tracking_data["Optimization / Successful optimizer steps"][-1] == 2
+    assert agent.tracking_data["Optimization / Grad norm"][-1] > 0
+    assert scheduler_step.call_count == 1

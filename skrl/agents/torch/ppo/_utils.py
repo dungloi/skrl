@@ -159,6 +159,83 @@ def any_rank_true(value: torch.Tensor) -> bool:
     return failed
 
 
+def synchronized_grad_scaler_step(
+    *, scaler: Any, optimizer: torch.optim.Optimizer, grad_norm: torch.Tensor
+) -> bool:
+    """Execute an optimizer step only when every distributed worker has finite gradients.
+
+    The caller must unscale the optimizer and compute ``grad_norm`` before calling this
+    helper. A post-step synchronization is too late: one worker may already have changed
+    its parameters while another worker's GradScaler skipped the step. Instead, synchronize
+    the finite-gradient decision first and skip the real optimizer on every worker if any
+    worker reports an overflow.
+
+    On a worker whose local gradients are finite, GradScaler would otherwise treat a remote
+    overflow as a successful iteration and grow (or retain) its scale. A throwaway optimizer
+    carrying an infinite sentinel gradient records the global overflow through GradScaler's
+    public API, so all workers apply the same backoff and reset their growth tracker.
+
+    :return: Whether the real optimizer step was executed successfully.
+    """
+
+    scaler_enabled = scaler.is_enabled()
+    if not scaler_enabled:
+        # Non-AMP callers already use the synchronized finite-gradient guard before
+        # entering this helper, so no additional collective is needed here.
+        scaler.step(optimizer)
+        scaler.update()
+        return True
+
+    scale_before_step = float(scaler.get_scale())
+    local_scale_is_valid = math.isfinite(scale_before_step) and scale_before_step > 0
+    optimizer_step_allowed = bool(torch.isfinite(grad_norm).all().item())
+    if config.torch.is_distributed:
+        safe_scale = scale_before_step if local_scale_is_valid else 0.0
+        # A single MIN collective obtains the global finite-gradient decision, scale
+        # validity, minimum scale and (through the negated value) maximum scale. Different
+        # scales mean backward/unscale used incompatible coordinates, so every worker must
+        # fail before any real optimizer can mutate parameters.
+        step_control = torch.tensor(
+            (float(optimizer_step_allowed), float(local_scale_is_valid), safe_scale, -safe_scale),
+            dtype=torch.float64,
+            device=grad_norm.device,
+        )
+        torch.distributed.all_reduce(step_control, op=torch.distributed.ReduceOp.MIN)
+        if not bool(step_control[1].item()):
+            raise RuntimeError("GradScaler scale must be finite and positive on every distributed rank")
+        minimum_scale = step_control[2].item()
+        maximum_scale = -step_control[3].item()
+        if minimum_scale != maximum_scale:
+            raise RuntimeError(
+                "GradScaler scale differs across distributed ranks "
+                f"(minimum {minimum_scale}, maximum {maximum_scale})"
+            )
+        optimizer_step_allowed = bool(step_control[0].item())
+    elif not local_scale_is_valid:
+        raise RuntimeError("GradScaler scale must be finite and positive")
+
+    globally_finite = optimizer_step_allowed
+    if globally_finite:
+        scaler.step(optimizer)
+    else:
+        # ``unscale_(optimizer)`` has already run, so changing a real gradient now would not
+        # update GradScaler's recorded found_inf state. Register the global overflow on a
+        # separate zero-LR optimizer instead. ``scaler.step`` is intentionally invoked for
+        # the sentinel optimizer and is skipped because its gradient is infinite.
+        overflow_marker = torch.nn.Parameter(torch.zeros((), device=grad_norm.device))
+        overflow_marker.grad = torch.full_like(overflow_marker, float("inf"))
+        overflow_optimizer = torch.optim.SGD((overflow_marker,), lr=0.0)
+        scaler.unscale_(overflow_optimizer)
+        scaler.step(overflow_optimizer)
+
+    scaler.update()
+    if not globally_finite:
+        return False
+    # GradScaler normally skips exactly when its recorded found_inf is non-zero. Keep this
+    # check for custom/fake scalers and as a defensive guard around future PyTorch behavior.
+    return scaler.get_scale() >= scale_before_step
+
+
 def validate_scalar_output(
     name: str, tensor: torch.Tensor, batch_size: int, *, synchronize: bool = False
 ) -> None:

@@ -1654,16 +1654,19 @@ def test_actual_cnn_gru_attention_models_replay_t80_l40_async_done_exactly():
     torch.testing.assert_close(replay_values, flat_values[sequence_indexes], rtol=1e-5, atol=1e-6)
 
 
-def _deployment_multimodal_space() -> gymnasium.spaces.Dict:
-    """Body-rate deployment shape: 16x5 ego and 4x5 history per neighbor."""
-
+def _deployment_multimodal_space(
+    *, ego_dim: int, other_dim: int, other_slots: int
+) -> gymnasium.spaces.Dict:
     return gymnasium.spaces.Dict(
         {
             "image": gymnasium.spaces.Box(-float("inf"), float("inf"), shape=(1, 32, 32), dtype="float32"),
-            "ego": gymnasium.spaces.Box(-float("inf"), float("inf"), shape=(80,), dtype="float32"),
-            "other_0": gymnasium.spaces.Box(-float("inf"), float("inf"), shape=(1, 20), dtype="float32"),
-            "other_1": gymnasium.spaces.Box(-float("inf"), float("inf"), shape=(1, 20), dtype="float32"),
-            "other_2": gymnasium.spaces.Box(-float("inf"), float("inf"), shape=(1, 20), dtype="float32"),
+            "ego": gymnasium.spaces.Box(-float("inf"), float("inf"), shape=(ego_dim,), dtype="float32"),
+            **{
+                f"other_{index}": gymnasium.spaces.Box(
+                    -float("inf"), float("inf"), shape=(1, other_dim), dtype="float32"
+                )
+                for index in range(other_slots)
+            },
         }
     )
 
@@ -1685,33 +1688,80 @@ def _deployment_network() -> dict[str, Any]:
     }
 
 
-def _deployment_multimodal_samples(rollouts: int, num_envs: int, seed: int) -> torch.Tensor:
+def _deployment_multimodal_samples(
+    rollouts: int,
+    num_envs: int,
+    seed: int,
+    *,
+    ego_dim: int,
+    other_dim: int,
+    other_slots: int,
+) -> torch.Tensor:
     generator = torch.Generator().manual_seed(seed)
     count = rollouts * num_envs
     native = {
         "image": torch.rand((count, 1, 32, 32), generator=generator),
-        "ego": torch.randn((count, 80), generator=generator) * 0.25,
-        "other_0": torch.randn((count, 1, 20), generator=generator) * 0.2,
-        "other_1": torch.randn((count, 1, 20), generator=generator) * 0.2,
-        "other_2": torch.randn((count, 1, 20), generator=generator) * 0.2,
+        "ego": torch.randn((count, ego_dim), generator=generator) * 0.25,
+        **{
+            f"other_{index}": torch.randn((count, 1, other_dim), generator=generator) * 0.2
+            for index in range(other_slots)
+        },
     }
     return flatten_tensorized_space(native).view(rollouts, num_envs, -1)
 
 
-def test_deployment_shape_full_ppo_rnn_update_smoke(record_property):
-    """Run the body-rate YAML geometry and optimizer settings on CPU end to end."""
+@pytest.mark.parametrize(
+    ("deployment_name", "ego_dim", "other_dim", "other_slots", "action_dim"),
+    [
+        # FAST-Swarm-Bodyrate: 16 ego features x 5 history frames and
+        # 4 neighbor features x 5 history frames in three structured slots.
+        pytest.param("bodyrate", 80, 20, 3, 4, id="bodyrate"),
+        # FAST-Swarm-Acc defaults: planar_mode=light, one history frame,
+        # num_observed_agents=7 (of 9 peers), one 32x32 camera and acc-xy actions.
+        pytest.param("acc-light", 17, 3, 7, 2, id="acc-light"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("device", "mixed_precision"),
+    [
+        pytest.param("cpu", False, id="cpu-fp32"),
+        pytest.param(
+            "cuda:0",
+            True,
+            id="cuda-amp",
+            marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available"),
+        ),
+    ],
+)
+def test_deployment_shape_full_ppo_rnn_update_smoke(
+    record_property,
+    deployment_name,
+    ego_dim,
+    other_dim,
+    other_slots,
+    action_dim,
+    device,
+    mixed_precision,
+):
+    """Run deployed observation geometries and the shared PPO-RNN YAML end to end."""
 
     rollouts, sequence_length, num_envs = 80, 40, 3
-    observation_space = _deployment_multimodal_space()
-    state_space = _deployment_multimodal_space()
-    action_space = gymnasium.spaces.Box(-1, 1, shape=(4,), dtype="float32")
+    observation_space = _deployment_multimodal_space(
+        ego_dim=ego_dim, other_dim=other_dim, other_slots=other_slots
+    )
+    state_space = _deployment_multimodal_space(
+        ego_dim=ego_dim, other_dim=other_dim, other_slots=other_slots
+    )
+    action_space = gymnasium.spaces.Box(-1, 1, shape=(action_dim,), dtype="float32")
     network = _deployment_network()
     torch.manual_seed(4242)
+    if device.startswith("cuda"):
+        torch.cuda.manual_seed_all(4242)
     policy = CNNGRUAttentionMLPPolicy(
         observation_space=observation_space,
         state_space=state_space,
         action_space=action_space,
-        device="cpu",
+        device=device,
         num_envs=num_envs,
         network=network,
         clip_actions=False,
@@ -1725,7 +1775,7 @@ def test_deployment_shape_full_ppo_rnn_update_smoke(record_property):
         observation_space=observation_space,
         state_space=state_space,
         action_space=action_space,
-        device="cpu",
+        device=device,
         num_envs=num_envs,
         network=network,
         clip_actions=False,
@@ -1757,34 +1807,49 @@ def test_deployment_shape_full_ppo_rnn_update_smoke(record_property):
             "observation_preprocessor_kwargs": {
                 "size": observation_space,
                 "exclude_keys": ["image"],
-                "device": "cpu",
+                "device": device,
             },
             "state_preprocessor": SelectiveRunningStandardScaler,
             "state_preprocessor_kwargs": {
                 "size": state_space,
                 "exclude_keys": ["image"],
-                "device": "cpu",
+                "device": device,
             },
             "value_preprocessor": RunningStandardScaler,
-            "value_preprocessor_kwargs": {"size": 1, "device": "cpu"},
+            "value_preprocessor_kwargs": {"size": 1, "device": device},
             "grad_norm_clip": 1.0,
             "value_loss_scale": 1.0,
             "time_limit_bootstrap": False,
+            "mixed_precision": mixed_precision,
         }
     )
     agent = PPO_RNN(
         models={"policy": policy, "value": value},
-        memory=RandomMemory(memory_size=rollouts, num_envs=num_envs, device="cpu"),
+        memory=RandomMemory(memory_size=rollouts, num_envs=num_envs, device=device),
         observation_space=observation_space,
         state_space=state_space,
         action_space=action_space,
-        device="cpu",
+        device=device,
         cfg=cfg,
     )
     agent.init()
-    observations = _deployment_multimodal_samples(rollouts + 1, num_envs, seed=7001)
-    states = _deployment_multimodal_samples(rollouts + 1, num_envs, seed=7002)
-    terminated = torch.zeros((rollouts, num_envs, 1), dtype=torch.bool)
+    observations = _deployment_multimodal_samples(
+        rollouts + 1,
+        num_envs,
+        seed=7001,
+        ego_dim=ego_dim,
+        other_dim=other_dim,
+        other_slots=other_slots,
+    ).to(device)
+    states = _deployment_multimodal_samples(
+        rollouts + 1,
+        num_envs,
+        seed=7002,
+        ego_dim=ego_dim,
+        other_dim=other_dim,
+        other_slots=other_slots,
+    ).to(device)
+    terminated = torch.zeros((rollouts, num_envs, 1), dtype=torch.bool, device=device)
     truncated = torch.zeros_like(terminated)
     terminated[17, 0] = True
     terminated[55, 1] = True
@@ -1795,7 +1860,10 @@ def test_deployment_shape_full_ppo_rnn_update_smoke(record_property):
     for timestep in range(rollouts):
         reward = (
             0.15
-            + torch.sin(torch.arange(num_envs, dtype=torch.float32).view(-1, 1) + timestep * 0.17)
+            + torch.sin(
+                torch.arange(num_envs, dtype=torch.float32, device=device).view(-1, 1)
+                + timestep * 0.17
+            )
         )
         with torch.no_grad():
             actions, _ = agent.act(
@@ -1815,11 +1883,15 @@ def test_deployment_shape_full_ppo_rnn_update_smoke(record_property):
                 timesteps=rollouts,
             )
 
-    assert agent._observation_preprocessor._selected_size == 140
-    assert agent._state_preprocessor._selected_size == 140
-    # Dict flattening is sorted: ego occupies [0:80], then image [80:1104].
+    selected_size = ego_dim + other_slots * other_dim
+    assert agent._observation_preprocessor._selected_size == selected_size
+    assert agent._state_preprocessor._selected_size == selected_size
+    # Dict flattening is sorted: ego precedes the 1024-element image.
     scaled_probe = agent._observation_preprocessor(observations[0])
-    torch.testing.assert_close(scaled_probe[:, 80:1104], observations[0, :, 80:1104], rtol=0, atol=0)
+    image_slice = slice(ego_dim, ego_dim + 32 * 32)
+    torch.testing.assert_close(
+        scaled_probe[:, image_slice], observations[0, :, image_slice], rtol=0, atol=0
+    )
     for name in ("rnn_policy_0", "rnn_value_0"):
         hidden = agent.memory.get_tensor_by_name(name)
         assert torch.count_nonzero(hidden[1, 1]) == 0
@@ -1831,6 +1903,7 @@ def test_deployment_shape_full_ppo_rnn_update_smoke(record_property):
     agent.enable_models_training_mode(True)
     agent.update(timestep=rollouts - 1, timesteps=rollouts)
 
+    record_property("deployment_name", deployment_name)
     record_property("configured_learning_epochs", agent.cfg.learning_epochs)
     record_property(
         "deployment_effective_minibatches",
@@ -1848,8 +1921,12 @@ def test_deployment_shape_full_ppo_rnn_update_smoke(record_property):
         "deployment_initial_replay_max_abs_log_ratio",
         agent.tracking_data["Policy / Initial replay max abs log-ratio"][-1],
     )
-    assert agent.tracking_data["Policy / Initial replay max abs log-ratio"][-1] < 2e-5
+    replay_tolerance = 5e-3 if mixed_precision else 2e-5
+    assert agent.tracking_data["Policy / Initial replay max abs log-ratio"][-1] < replay_tolerance
     assert agent.tracking_data["Optimization / Effective minibatches"][-1] > 0
+    assert agent.tracking_data["Optimization / Successful optimizer steps"][-1] > 0
+    assert agent.scaler.is_enabled() is mixed_precision
+    assert agent.tracking_data["Optimization / Gradient overflow count"][-1] >= 0
     assert any(not torch.equal(old, new) for old, new in zip(policy_before, policy.parameters()))
     assert any(not torch.equal(old, new) for old, new in zip(value_before, value.parameters()))
     assert all(torch.isfinite(parameter).all() for parameter in policy.parameters())

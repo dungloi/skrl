@@ -23,6 +23,7 @@ from ._utils import (
     ensure_full_rollout,
     require_finite,
     require_finite_model,
+    synchronized_grad_scaler_step,
     validate_ppo_setup,
     validate_rnn_output,
     validate_scalar_output,
@@ -725,6 +726,8 @@ class PPO_RNN(Agent):
         cumulative_entropy = 0
         cumulative_value_clip_fraction = 0
         cumulative_grad_norm = 0
+        finite_grad_norm_count = 0
+        gradient_overflow_count = 0
         max_approx_kl = float("-inf")
         kl_early_stop_count = 0
         observed_minibatches = 0
@@ -932,18 +935,12 @@ class PPO_RNN(Agent):
 
                 if not self.scaler.is_enabled():
                     require_finite("PPO_RNN gradient norm", grad_norm, synchronize=True)
-
-                track_optimizer_step = self.scaler.is_enabled()
-                scale_before_step = self.scaler.get_scale() if track_optimizer_step else None
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-                optimizer_step_succeeded = not track_optimizer_step or self.scaler.get_scale() >= scale_before_step
-                if config.torch.is_distributed and track_optimizer_step:
-                    optimizer_step_succeeded_tensor = torch.tensor(
-                        optimizer_step_succeeded, dtype=torch.int32, device=self.device
-                    )
-                    torch.distributed.all_reduce(optimizer_step_succeeded_tensor, op=torch.distributed.ReduceOp.MIN)
-                    optimizer_step_succeeded = bool(optimizer_step_succeeded_tensor.item())
+                grad_norm_is_finite = bool(torch.isfinite(grad_norm).item())
+                optimizer_step_succeeded = synchronized_grad_scaler_step(
+                    scaler=self.scaler, optimizer=self.optimizer, grad_norm=grad_norm
+                )
+                if self.scaler.is_enabled() and not optimizer_step_succeeded:
+                    gradient_overflow_count += 1
                 if optimizer_step_succeeded:
                     epoch_optimizer_steps += 1
                     optimizer_steps += 1
@@ -956,7 +953,9 @@ class PPO_RNN(Agent):
                 cumulative_entropy += entropy.item() * entropy_batch_samples
                 entropy_samples += entropy_batch_samples
                 cumulative_value_clip_fraction += value_clip_fraction.item() * explained_variance_batch_samples
-                cumulative_grad_norm += grad_norm.item()
+                if grad_norm_is_finite:
+                    cumulative_grad_norm += grad_norm.item()
+                    finite_grad_norm_count += 1
                 effective_minibatches += 1
                 effective_samples += explained_variance_batch_samples
                 explained_variance_samples += explained_variance_batch_samples
@@ -1077,7 +1076,8 @@ class PPO_RNN(Agent):
             )
         self.track_data("Value / Explained variance", explained_variance)
         self.track_data("Value / Clip fraction", cumulative_value_clip_fraction / effective_samples_safe)
-        self.track_data("Optimization / Grad norm", cumulative_grad_norm / effective_minibatches_safe)
+        self.track_data("Optimization / Grad norm", cumulative_grad_norm / max(finite_grad_norm_count, 1))
+        self.track_data("Optimization / Gradient overflow count", gradient_overflow_count)
         self.track_data("Optimization / KL early-stop count", kl_early_stop_count)
         self.track_data("Optimization / Effective minibatches", effective_minibatches)
         self.track_data("Optimization / Observed minibatches", observed_minibatches)
