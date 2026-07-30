@@ -16,6 +16,7 @@ from skrl.memories.torch import Memory
 from skrl.models.torch import Model
 from skrl.resources.schedulers.torch import KLAdaptiveLR
 from skrl.utils import ScopedTimer
+from skrl.utils.training_profile import training_profile_event, training_profile_range
 
 from .ppo_cfg import PPO_CFG
 from ._utils import (
@@ -240,10 +241,11 @@ class PPO(Agent):
         :return: Agent output. The first component is the expected action/value returned by the agent.
             The second component is a dictionary containing extra output values according to the model.
         """
-        inputs = {
-            "observations": self._observation_preprocessor(observations),
-            "states": self._state_preprocessor(states),
-        }
+        with training_profile_range("ppo/rollout/action_preprocess"):
+            inputs = {
+                "observations": self._observation_preprocessor(observations),
+                "states": self._state_preprocessor(states),
+            }
         self._current_is_random = timestep < self.cfg.random_timesteps
         # sample random actions
         # TODO, check for stochasticity
@@ -262,11 +264,13 @@ class PPO(Agent):
 
         # sample stochastic actions
         with torch.autocast(device_type=self._device_type, enabled=self.cfg.mixed_precision):
-            actions, outputs = self.policy.act(inputs, role="policy")
-            self._current_log_prob = outputs["log_prob"]
-            validate_scalar_output(
-                "PPO policy log_prob", self._current_log_prob, observations.shape[0], synchronize=True
-            )
+            with training_profile_range("ppo/rollout/policy_forward_and_sample"):
+                actions, outputs = self.policy.act(inputs, role="policy")
+                self._current_log_prob = outputs["log_prob"]
+            with training_profile_range("ppo/rollout/policy_validation"):
+                validate_scalar_output(
+                    "PPO policy log_prob", self._current_log_prob, observations.shape[0], synchronize=True
+                )
 
         return actions, outputs
 
@@ -328,13 +332,16 @@ class PPO(Agent):
 
             # compute values
             with torch.autocast(device_type=self._device_type, enabled=self.cfg.mixed_precision):
-                inputs = {
-                    "observations": self._observation_preprocessor(observations),
-                    "states": self._state_preprocessor(states),
-                }
-                values, _ = self.value.act(inputs, role="value")
-                validate_scalar_output("PPO value", values, observations.shape[0], synchronize=True)
-                values = self._value_preprocessor(values, inverse=True)
+                with training_profile_range("ppo/rollout/value_preprocess"):
+                    inputs = {
+                        "observations": self._observation_preprocessor(observations),
+                        "states": self._state_preprocessor(states),
+                    }
+                with training_profile_range("ppo/rollout/value_forward"):
+                    values, _ = self.value.act(inputs, role="value")
+                with training_profile_range("ppo/rollout/value_validation"):
+                    validate_scalar_output("PPO value", values, observations.shape[0], synchronize=True)
+                    values = self._value_preprocessor(values, inverse=True)
 
             # time-limit (truncation) bootstrapping
             timeout_mask = truncated & ~terminated
@@ -365,16 +372,17 @@ class PPO(Agent):
                 rewards = rewards + self.cfg.discount_factor * timeout_values * timeout_mask
 
             # storage transition in memory
-            self.memory.add_samples(
-                observations=observations,
-                states=states,
-                actions=actions,
-                rewards=rewards,
-                terminated=terminated,
-                truncated=truncated,
-                log_prob=self._current_log_prob,
-                values=values,
-            )
+            with training_profile_range("ppo/rollout/memory_write"):
+                self.memory.add_samples(
+                    observations=observations,
+                    states=states,
+                    actions=actions,
+                    rewards=rewards,
+                    terminated=terminated,
+                    truncated=truncated,
+                    log_prob=self._current_log_prob,
+                    values=values,
+                )
             self._rollout_consumed = False
 
     def pre_interaction(self, *, timestep: int, timesteps: int) -> None:
@@ -422,6 +430,31 @@ class PPO(Agent):
         :param timestep: Current timestep.
         :param timesteps: Number of timesteps.
         """
+        success = False
+        training_profile_event(
+            "update_start",
+            agent=self,
+            algorithm="PPO",
+            timestep=timestep,
+            timesteps=timesteps,
+        )
+        try:
+            with training_profile_range("ppo/update"):
+                self._update(timestep=timestep, timesteps=timesteps)
+            success = True
+        finally:
+            training_profile_event(
+                "update_end",
+                agent=self,
+                algorithm="PPO",
+                timestep=timestep,
+                timesteps=timesteps,
+                success=success,
+            )
+
+    def _update(self, *, timestep: int, timesteps: int) -> None:
+        """Execute the PPO update body under the public profiling boundary."""
+
         ensure_full_rollout(name="PPO", memory=self.memory, consumed=self._rollout_consumed)
         require_finite_model("PPO policy", self.policy, synchronize=True)
         if self.value is not self.policy:
@@ -522,10 +555,27 @@ class PPO(Agent):
             epoch_kl_sum = torch.zeros((), dtype=torch.float64, device=self.device)
             epoch_kl_samples = 0
             epoch_optimizer_steps = 0
-            sampled_batches = sample_minibatches()
+            training_profile_event(
+                "sampling_start",
+                agent=self,
+                algorithm="PPO",
+                epoch=epoch,
+                mini_batches=mini_batches,
+            )
+            try:
+                with training_profile_range("ppo/update/sample_minibatches"):
+                    sampled_batches = sample_minibatches()
+            finally:
+                training_profile_event(
+                    "sampling_end",
+                    agent=self,
+                    algorithm="PPO",
+                    epoch=epoch,
+                    mini_batches=mini_batches,
+                )
 
             # mini-batches loop
-            for (
+            for i, (
                 sampled_observations,
                 sampled_states,
                 sampled_actions,
@@ -533,7 +583,16 @@ class PPO(Agent):
                 sampled_values,
                 sampled_returns,
                 sampled_advantages,
-            ) in sampled_batches:
+            ) in enumerate(sampled_batches):
+                training_profile_event(
+                    "minibatch_start",
+                    agent=self,
+                    algorithm="PPO",
+                    epoch=epoch,
+                    minibatch=i,
+                    mini_batches=mini_batches,
+                    samples=sampled_observations.shape[0],
+                )
 
                 with torch.autocast(device_type=self._device_type, enabled=self.cfg.mixed_precision):
                     inputs = {
@@ -590,6 +649,14 @@ class PPO(Agent):
                     if should_early_stop:
                         kl_early_stop_count += 1
                         update_early_stop = True
+                        training_profile_event(
+                            "minibatch_end",
+                            agent=self,
+                            algorithm="PPO",
+                            epoch=epoch,
+                            minibatch=i,
+                            status="kl_early_stop",
+                        )
                         break
 
                     # compute entropy loss
@@ -697,6 +764,14 @@ class PPO(Agent):
                 effective_minibatches += 1
                 effective_samples += explained_variance_batch_samples
                 explained_variance_samples += explained_variance_batch_samples
+                training_profile_event(
+                    "minibatch_end",
+                    agent=self,
+                    algorithm="PPO",
+                    epoch=epoch,
+                    minibatch=i,
+                    status="complete",
+                )
 
             # update learning rate
             if self.scheduler:

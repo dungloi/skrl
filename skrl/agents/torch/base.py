@@ -18,6 +18,7 @@ from skrl import config, logger
 from skrl.memories.torch import Memory
 from skrl.models.torch import Model
 from skrl.utils.tensorboard import SummaryWriter
+from skrl.utils.training_profile import training_profile_range
 
 
 @dataclasses.dataclass(kw_only=True)
@@ -467,21 +468,23 @@ class Agent(ABC):
 
         # update best models and write checkpoints
         if timestep > 1 and self.checkpoint_interval > 0 and not timestep % self.checkpoint_interval:
-            # update best models
-            reward = np.mean(self.tracking_data.get("Reward / Total reward (mean)", -(2**31)))
-            if reward > self.checkpoint_best_modules["reward"]:
-                self.checkpoint_best_modules["timestep"] = timestep
-                self.checkpoint_best_modules["reward"] = reward
-                self.checkpoint_best_modules["saved"] = False
-                self.checkpoint_best_modules["modules"] = {
-                    k: copy.deepcopy(self._get_internal_value(v)) for k, v in self.checkpoint_modules.items()
-                }
-            # write checkpoints
-            self.write_checkpoint(timestep=timestep, timesteps=timesteps)
+            with training_profile_range("agent/post_interaction/checkpoint"):
+                # update best models
+                reward = np.mean(self.tracking_data.get("Reward / Total reward (mean)", -(2**31)))
+                if reward > self.checkpoint_best_modules["reward"]:
+                    self.checkpoint_best_modules["timestep"] = timestep
+                    self.checkpoint_best_modules["reward"] = reward
+                    self.checkpoint_best_modules["saved"] = False
+                    self.checkpoint_best_modules["modules"] = {
+                        k: copy.deepcopy(self._get_internal_value(v)) for k, v in self.checkpoint_modules.items()
+                    }
+                # write checkpoints
+                self.write_checkpoint(timestep=timestep, timesteps=timesteps)
 
         # write to tensorboard
         if timestep > 1 and self.write_interval > 0 and not timestep % self.write_interval:
-            self.write_tracking_data(timestep=timestep, timesteps=timesteps)
+            with training_profile_range("agent/post_interaction/logging"):
+                self.write_tracking_data(timestep=timestep, timesteps=timesteps)
 
     @abstractmethod
     def update(self, *, timestep: int, timesteps: int) -> None:

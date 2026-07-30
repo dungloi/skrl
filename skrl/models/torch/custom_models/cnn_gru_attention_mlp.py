@@ -24,6 +24,7 @@ import torch.nn as nn
 
 from skrl.models.torch import DeterministicMixin, GaussianMixin, Model
 from skrl.utils.spaces.torch import unflatten_tensorized_space
+from skrl.utils.training_profile import training_profile_event, training_profile_range
 
 from .utils import (
     _build_cnn,
@@ -331,6 +332,25 @@ class _CNNGRUAttentionMLPCommon:
             }
         }
 
+    def _profiled_gru(
+        self,
+        inputs: torch.Tensor,
+        hidden_states: torch.Tensor,
+        *,
+        segment_length: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run one physical GRU call and expose its segmentation to the training profiler."""
+
+        training_profile_event(
+            "gru_call",
+            model=self,
+            training=self.training,
+            segment_length=segment_length,
+        )
+        range_name = "model/gru/training_segment" if self.training else "model/gru/rollout_step"
+        with training_profile_range(range_name):
+            return self.gru(inputs, hidden_states)
+
     def _run_gru(
         self, step_features: torch.Tensor, inputs: dict[str, Any]
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -345,7 +365,11 @@ class _CNNGRUAttentionMLPCommon:
                 device=step_features.device,
                 dtype=step_features.dtype,
             )
-            rnn_output, _ = self.gru(step_features.unsqueeze(1), zero_hidden)
+            rnn_output, _ = self._profiled_gru(
+                step_features.unsqueeze(1),
+                zero_hidden,
+                segment_length=1,
+            )
             return rnn_output.squeeze(1), None
 
         # 2. rollout 与 training 的 hidden state 组织方式不同，分别处理
@@ -379,18 +403,30 @@ class _CNNGRUAttentionMLPCommon:
 
                 for i in range(len(indexes) - 1):
                     i0, i1 = indexes[i], indexes[i + 1]
-                    rnn_output, hidden_states = self.gru(rnn_input[:, i0:i1, :], hidden_states)
+                    rnn_output, hidden_states = self._profiled_gru(
+                        rnn_input[:, i0:i1, :],
+                        hidden_states,
+                        segment_length=i1 - i0,
+                    )
                     hidden_states[:, done[:, i1 - 1], :] = 0
                     rnn_outputs.append(rnn_output)
 
                 rnn_output = torch.cat(rnn_outputs, dim=1)
             # 若序列中没有 done，则可以直接整段运行 GRU
             else:
-                rnn_output, hidden_states = self.gru(rnn_input, hidden_states)
+                rnn_output, hidden_states = self._profiled_gru(
+                    rnn_input,
+                    hidden_states,
+                    segment_length=self.sequence_length,
+                )
         # rollout 阶段每次只处理一个时间步，因此 sequence_length = 1
         else:
             rnn_input = step_features.view(-1, 1, step_features.shape[-1])
-            rnn_output, hidden_states = self.gru(rnn_input, hidden_states)
+            rnn_output, hidden_states = self._profiled_gru(
+                rnn_input,
+                hidden_states,
+                segment_length=1,
+            )
 
         # 3. 将 GRU 输出重新展平成后续 MLP 需要的二维 batch
         rnn_output = torch.flatten(rnn_output, start_dim=0, end_dim=1)

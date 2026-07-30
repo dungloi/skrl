@@ -13,6 +13,7 @@ from skrl.agents.torch import Agent
 from skrl.envs.wrappers.torch import MultiAgentEnvWrapper, Wrapper
 from skrl.multi_agents.torch import MultiAgent
 from skrl.utils import ScopedTimer
+from skrl.utils.training_profile import training_profile_event, training_profile_range
 
 
 def generate_equally_spaced_scopes(*, num_envs: int, num_simultaneous_agents: int) -> list[int]:
@@ -199,51 +200,60 @@ class Trainer(ABC):
         states = self.env.state()
 
         for timestep in tqdm.tqdm(range(self.cfg.timesteps), disable=self.cfg.disable_progressbar, file=sys.stdout):
+            training_profile_event("trainer_step_start", trainer=self, timestep=timestep)
 
             # pre-interaction
-            self.agents.pre_interaction(timestep=timestep, timesteps=self.cfg.timesteps)
+            with training_profile_range("trainer/rollout/pre_interaction"):
+                self.agents.pre_interaction(timestep=timestep, timesteps=self.cfg.timesteps)
 
             with torch.no_grad():
                 # compute actions
-                with ScopedTimer() as timer:
-                    actions, outputs = self.agents.act(
-                        observations, states, timestep=timestep, timesteps=self.cfg.timesteps
-                    )
-                    self.agents.track_data("Stats / Inference time (ms)", timer.elapsed_time_ms)
+                with training_profile_range("trainer/rollout/policy_act"):
+                    with ScopedTimer() as timer:
+                        actions, outputs = self.agents.act(
+                            observations, states, timestep=timestep, timesteps=self.cfg.timesteps
+                        )
+                        self.agents.track_data("Stats / Inference time (ms)", timer.elapsed_time_ms)
 
                 # step the environments
                 with ScopedTimer() as timer:
-                    next_observations, rewards, terminated, truncated, infos = self.env.step(actions)
-                    next_states = self.env.state()
+                    with training_profile_range("trainer/rollout/env_step"):
+                        next_observations, rewards, terminated, truncated, infos = self.env.step(actions)
+                    with training_profile_range("trainer/rollout/env_state"):
+                        next_states = self.env.state()
                     self.agents.track_data("Stats / Env stepping time (ms)", timer.elapsed_time_ms)
 
                 # render the environments
                 if not self.cfg.headless and not timestep % self.cfg.render_interval:
-                    self.env.render()
+                    with training_profile_range("trainer/rollout/render"):
+                        self.env.render()
 
                 # record the environments' transitions
-                self.agents.record_transition(
-                    observations=observations,
-                    states=states,
-                    actions=actions,
-                    rewards=rewards,
-                    next_observations=next_observations,
-                    next_states=next_states,
-                    terminated=terminated,
-                    truncated=truncated,
-                    infos=infos,
-                    timestep=timestep,
-                    timesteps=self.cfg.timesteps,
-                )
+                with training_profile_range("trainer/rollout/record_transition"):
+                    self.agents.record_transition(
+                        observations=observations,
+                        states=states,
+                        actions=actions,
+                        rewards=rewards,
+                        next_observations=next_observations,
+                        next_states=next_states,
+                        terminated=terminated,
+                        truncated=truncated,
+                        infos=infos,
+                        timestep=timestep,
+                        timesteps=self.cfg.timesteps,
+                    )
 
                 # log environment info
-                if self.cfg.environment_info in infos:
-                    for k, v in infos[self.cfg.environment_info].items():
-                        if isinstance(v, torch.Tensor) and v.numel() == 1:
-                            self.agents.track_data(k if "/" in k else f"Info / {k}", v.item())
+                with training_profile_range("trainer/rollout/environment_info"):
+                    if self.cfg.environment_info in infos:
+                        for k, v in infos[self.cfg.environment_info].items():
+                            if isinstance(v, torch.Tensor) and v.numel() == 1:
+                                self.agents.track_data(k if "/" in k else f"Info / {k}", v.item())
 
             # post-interaction
-            self.agents.post_interaction(timestep=timestep, timesteps=self.cfg.timesteps)
+            with training_profile_range("trainer/rollout/post_interaction"):
+                self.agents.post_interaction(timestep=timestep, timesteps=self.cfg.timesteps)
 
             # reset environments
             # - parallel/vectorized environments (single or multi-agent)
@@ -267,6 +277,7 @@ class Trainer(ABC):
                 else:
                     observations = next_observations
                     states = next_states
+            training_profile_event("trainer_step_end", trainer=self, timestep=timestep)
 
     def eval(self) -> None:
         """Evaluate a single/multi-agent.
