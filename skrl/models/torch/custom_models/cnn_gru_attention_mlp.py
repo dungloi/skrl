@@ -208,6 +208,7 @@ class _CNNGRUAttentionMLPCommon:
         self.num_layers = gru_cfg["num_layers"]
         self.hidden_size = gru_cfg["hidden_size"]
         self.separate_feature_projection = gru_cfg["separate_feature_projection"]
+        self.recurrent_batching = gru_cfg["recurrent_batching"]
 
         # 3. 按配置构建 CNN backbone，并在保留空间布局的前提下压缩视觉特征
         cnn_with_flatten = _build_cnn(in_channels, cnn_cfg)
@@ -366,27 +367,24 @@ class _CNNGRUAttentionMLPCommon:
             # 只保留每段序列起始位置对应的 hidden state
             hidden_states = hidden_states[:, :, 0, :].contiguous()
 
-            # 若序列中间存在 done，则需要分段运行 GRU 并重置对应 hidden state
+            # 若序列中间存在 done，则在 episode 边界后重置对应 hidden state
             done = _merge_done_flags(inputs)
-            if done is not None and torch.any(done):
-                rnn_outputs = []
-                done = done.view(-1, self.sequence_length)
-                indexes = (
-                    [0]
-                    + (done[:, :-1].any(dim=0).nonzero(as_tuple=True)[0] + 1).tolist()
-                    + [self.sequence_length]
+            done = done.view(-1, self.sequence_length) if done is not None else None
+            has_internal_done = done is not None and bool(done[:, :-1].any().item())
+            if has_internal_done and self.recurrent_batching == "legacy":
+                rnn_output, hidden_states = self._run_gru_with_resets_legacy(
+                    rnn_input, hidden_states, done
                 )
-
-                for i in range(len(indexes) - 1):
-                    i0, i1 = indexes[i], indexes[i + 1]
-                    rnn_output, hidden_states = self.gru(rnn_input[:, i0:i1, :], hidden_states)
-                    hidden_states[:, done[:, i1 - 1], :] = 0
-                    rnn_outputs.append(rnn_output)
-
-                rnn_output = torch.cat(rnn_outputs, dim=1)
-            # 若序列中没有 done，则可以直接整段运行 GRU
+            elif has_internal_done:
+                rnn_output, hidden_states = self._run_gru_with_resets_packed(
+                    rnn_input, hidden_states, done
+                )
             else:
                 rnn_output, hidden_states = self.gru(rnn_input, hidden_states)
+                if done is not None:
+                    hidden_states = hidden_states.masked_fill(
+                        done[:, -1].view(1, -1, 1), 0
+                    )
         # rollout 阶段每次只处理一个时间步，因此 sequence_length = 1
         else:
             rnn_input = step_features.view(-1, 1, step_features.shape[-1])
@@ -394,6 +392,117 @@ class _CNNGRUAttentionMLPCommon:
 
         # 3. 将 GRU 输出重新展平成后续 MLP 需要的二维 batch
         rnn_output = torch.flatten(rnn_output, start_dim=0, end_dim=1)
+        return rnn_output, hidden_states
+
+    def _run_gru_with_resets_legacy(
+        self,
+        rnn_input: torch.Tensor,
+        hidden_states: torch.Tensor,
+        done: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Reference path that loops over the union of done boundaries."""
+        rnn_outputs = []
+        indexes = (
+            [0]
+            + (done[:, :-1].any(dim=0).nonzero(as_tuple=True)[0] + 1).tolist()
+            + [self.sequence_length]
+        )
+        for i0, i1 in zip(indexes[:-1], indexes[1:]):
+            rnn_output, hidden_states = self.gru(rnn_input[:, i0:i1, :], hidden_states)
+            hidden_states = hidden_states.masked_fill(
+                done[:, i1 - 1].view(1, -1, 1), 0
+            )
+            rnn_outputs.append(rnn_output)
+        return torch.cat(rnn_outputs, dim=1), hidden_states
+
+    def _run_gru_with_resets_packed(
+        self,
+        rnn_input: torch.Tensor,
+        hidden_states: torch.Tensor,
+        done: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Replay all episode fragments with one packed GRU invocation.
+
+        A done transition contributes its own output and clears the hidden state
+        consumed by the next transition. Splitting at ``done[:, :-1]`` preserves
+        that recurrence while batching fragments from all sequences together.
+        """
+        sequence_count, sequence_length, _ = rnn_input.shape
+        starts = torch.zeros_like(done, dtype=torch.bool)
+        starts[:, 0] = True
+        starts[:, 1:] = done[:, :-1]
+        segment_rows, segment_starts = starts.nonzero(as_tuple=True)
+        segment_count = segment_rows.shape[0]
+
+        next_rows = torch.empty_like(segment_rows)
+        next_starts = torch.empty_like(segment_starts)
+        next_rows[:-1] = segment_rows[1:]
+        next_starts[:-1] = segment_starts[1:]
+        next_rows[-1] = -1
+        next_starts[-1] = sequence_length
+        segment_ends = torch.where(
+            next_rows == segment_rows,
+            next_starts,
+            torch.full_like(segment_starts, sequence_length),
+        )
+        segment_lengths = segment_ends - segment_starts
+        max_segment_length = int(segment_lengths.max().item())
+
+        offsets = torch.arange(max_segment_length, device=rnn_input.device)
+        segment_steps = segment_starts.unsqueeze(1) + offsets.unsqueeze(0)
+        valid_steps = offsets.unsqueeze(0) < segment_lengths.unsqueeze(1)
+        safe_segment_steps = segment_steps.clamp_max(sequence_length - 1)
+        padded_input = rnn_input[
+            segment_rows.unsqueeze(1), safe_segment_steps
+        ].masked_fill(~valid_steps.unsqueeze(-1), 0)
+
+        segment_hidden = hidden_states.new_zeros(
+            self.num_layers, segment_count, self.hidden_size
+        )
+        first_segment_ids = (segment_starts == 0).nonzero(as_tuple=True)[0]
+        segment_hidden = segment_hidden.index_copy(
+            1,
+            first_segment_ids,
+            hidden_states.index_select(
+                1, segment_rows.index_select(0, first_segment_ids)
+            ),
+        )
+
+        packed_input = nn.utils.rnn.pack_padded_sequence(
+            padded_input,
+            segment_lengths.detach().to(device="cpu"),
+            batch_first=True,
+            enforce_sorted=False,
+        )
+        packed_output, segment_final_hidden = self.gru(packed_input, segment_hidden)
+        padded_output, _ = nn.utils.rnn.pad_packed_sequence(
+            packed_output,
+            batch_first=True,
+            total_length=max_segment_length,
+        )
+
+        flat_output = padded_output.new_zeros(
+            sequence_count * sequence_length, self.hidden_size
+        )
+        flat_positions = (
+            segment_rows.unsqueeze(1) * sequence_length + safe_segment_steps
+        )[valid_steps]
+        flat_output = flat_output.index_copy(
+            0, flat_positions, padded_output[valid_steps]
+        )
+        rnn_output = flat_output.view(
+            sequence_count, sequence_length, self.hidden_size
+        )
+
+        last_segment = torch.ones(
+            segment_count, dtype=torch.bool, device=segment_rows.device
+        )
+        last_segment[:-1] = segment_rows[:-1] != segment_rows[1:]
+        last_segment_ids = last_segment.nonzero(as_tuple=True)[0]
+        hidden_states = segment_final_hidden.index_select(1, last_segment_ids)
+        hidden_states = hidden_states.masked_fill(
+            done[:, -1].view(1, -1, 1), 0
+        )
         return rnn_output, hidden_states
 
     def _compute_features(
@@ -647,6 +756,7 @@ class CNNGRUAttentionMLPPolicy(_CNNGRUAttentionMLPCommon, GaussianMixin, Model):
                 ("hidden_size", self._gru_cfg["hidden_size"]),
                 ("num_layers", self._gru_cfg["num_layers"]),
                 ("sequence_length", self._gru_cfg["sequence_length"]),
+                ("recurrent_batching", self._gru_cfg["recurrent_batching"]),
                 ("separate_feature_projection", self._gru_cfg["separate_feature_projection"]),
             ],
         )
@@ -803,6 +913,7 @@ class CNNGRUAttentionMLPValue(_CNNGRUAttentionMLPCommon, DeterministicMixin, Mod
                 ("hidden_size", self._gru_cfg["hidden_size"]),
                 ("num_layers", self._gru_cfg["num_layers"]),
                 ("sequence_length", self._gru_cfg["sequence_length"]),
+                ("recurrent_batching", self._gru_cfg["recurrent_batching"]),
                 ("separate_feature_projection", self._gru_cfg["separate_feature_projection"]),
             ],
         )

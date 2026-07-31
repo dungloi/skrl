@@ -664,6 +664,8 @@ class PPO_RNN(Agent):
 
         # Build randomized mini-batches on complete recurrent sequence boundaries.
         rnn_policy, rnn_value = {}, {}
+        sampled_tensor_count = len(self._tensors_names)
+        sampled_names = [*self._tensors_names, *self._rnn_tensors_names]
         if self._rnn_sequence_length > 1:
             if self.memory.memory_size % self._rnn_sequence_length:
                 raise ValueError(
@@ -683,18 +685,14 @@ class PPO_RNN(Agent):
                     else torch.randperm(sequence_indexes.shape[0], device=self.device)
                 )
                 shuffled_sequences = sequence_indexes[permutation]
-                index_batches = [
-                    batch.flatten() for batch in torch.tensor_split(shuffled_sequences, mini_batches)
-                ]
-                sampled = [
-                    self.memory.sample_by_index(names=self._tensors_names, indexes=indexes)[0]
-                    for indexes in index_batches
-                ]
-                sampled_rnn = [
-                    self.memory.sample_by_index(names=self._rnn_tensors_names, indexes=indexes)[0]
-                    for indexes in index_batches
-                ] if self._rnn else []
-                return sampled, sampled_rnn
+                for batch in torch.tensor_split(shuffled_sequences, mini_batches):
+                    sampled = self.memory.sample_by_index(
+                        names=sampled_names, indexes=batch.flatten()
+                    )[0]
+                    yield (
+                        sampled[:sampled_tensor_count],
+                        sampled[sampled_tensor_count:],
+                    )
         else:
             mini_batches = max(1, min(self.cfg.mini_batches, len(self.memory)))
 
@@ -704,16 +702,14 @@ class PPO_RNN(Agent):
                     if mini_batches == 1
                     else torch.randperm(len(self.memory), device=self.device)
                 )
-                index_batches = torch.tensor_split(indexes, mini_batches)
-                sampled = [
-                    self.memory.sample_by_index(names=self._tensors_names, indexes=batch)[0]
-                    for batch in index_batches
-                ]
-                sampled_rnn = [
-                    self.memory.sample_by_index(names=self._rnn_tensors_names, indexes=batch)[0]
-                    for batch in index_batches
-                ] if self._rnn else []
-                return sampled, sampled_rnn
+                for batch in torch.tensor_split(indexes, mini_batches):
+                    sampled = self.memory.sample_by_index(
+                        names=sampled_names, indexes=batch
+                    )[0]
+                    yield (
+                        sampled[:sampled_tensor_count],
+                        sampled[sampled_tensor_count:],
+                    )
 
         cumulative_policy_loss = 0
         cumulative_entropy_loss = 0
@@ -749,25 +745,25 @@ class PPO_RNN(Agent):
             epoch_kl_sum = torch.zeros((), dtype=torch.float64, device=self.device)
             epoch_kl_samples = 0
             epoch_optimizer_steps = 0
-            sampled_batches, sampled_rnn_batches = sample_minibatches()
 
             # mini-batches loop
-            for i, (
-                sampled_observations,
-                sampled_states,
-                sampled_actions,
-                sampled_terminated,
-                sampled_truncated,
-                sampled_log_prob,
-                sampled_values,
-                sampled_returns,
-                sampled_advantages,
-            ) in enumerate(sampled_batches):
+            for sampled_batch, sampled_rnn_batch in sample_minibatches():
+                (
+                    sampled_observations,
+                    sampled_states,
+                    sampled_actions,
+                    sampled_terminated,
+                    sampled_truncated,
+                    sampled_log_prob,
+                    sampled_values,
+                    sampled_returns,
+                    sampled_advantages,
+                ) = sampled_batch
 
                 if self._rnn:
                     if self.policy is self.value:
                         rnn_policy = {
-                            "rnn": [s.transpose(0, 1) for s in sampled_rnn_batches[i]],
+                            "rnn": [s.transpose(0, 1) for s in sampled_rnn_batch],
                             "terminated": sampled_terminated,
                             "truncated": sampled_truncated,
                         }
@@ -776,7 +772,7 @@ class PPO_RNN(Agent):
                         rnn_policy = {
                             "rnn": [
                                 s.transpose(0, 1)
-                                for s, n in zip(sampled_rnn_batches[i], self._rnn_tensors_names)
+                                for s, n in zip(sampled_rnn_batch, self._rnn_tensors_names)
                                 if "policy" in n
                             ],
                             "terminated": sampled_terminated,
@@ -785,7 +781,7 @@ class PPO_RNN(Agent):
                         rnn_value = {
                             "rnn": [
                                 s.transpose(0, 1)
-                                for s, n in zip(sampled_rnn_batches[i], self._rnn_tensors_names)
+                                for s, n in zip(sampled_rnn_batch, self._rnn_tensors_names)
                                 if "value" in n
                             ],
                             "terminated": sampled_terminated,

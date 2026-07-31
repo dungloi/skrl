@@ -270,7 +270,7 @@ def _normalize_gru_cfg(raw_cfg: Any) -> dict[str, Any]:
 
     Returns:
         标准化后的 GRU 配置，包含 `hidden_size`、`num_layers`、`sequence_length`
-        与可选的 `separate_feature_projection`。
+        以及可选的 `separate_feature_projection` 和 `recurrent_batching`。
 
     Raises:
         ValueError: 当缺少必需字段、存在未知字段、类型非法或数值非正时抛出。
@@ -281,7 +281,7 @@ def _normalize_gru_cfg(raw_cfg: Any) -> dict[str, Any]:
 
     # 先校验字段完整性与合法性，再做值校验
     required_keys = {"hidden_size", "num_layers", "sequence_length"}
-    allowed_keys = required_keys | {"separate_feature_projection"}
+    allowed_keys = required_keys | {"separate_feature_projection", "recurrent_batching"}
     _check_unknown_keys(raw_cfg, allowed_keys, "network.gru")
     missing_keys = sorted(required_keys - set(raw_cfg.keys()))
     if missing_keys:
@@ -293,6 +293,7 @@ def _normalize_gru_cfg(raw_cfg: Any) -> dict[str, Any]:
         "num_layers": raw_cfg["num_layers"],
         "sequence_length": raw_cfg["sequence_length"],
         "separate_feature_projection": raw_cfg.get("separate_feature_projection", False),
+        "recurrent_batching": raw_cfg.get("recurrent_batching", "packed"),
     }
     for key in required_keys:
         value = cfg[key]
@@ -302,6 +303,14 @@ def _normalize_gru_cfg(raw_cfg: Any) -> dict[str, Any]:
         raise ValueError(
             "Invalid `network.gru.separate_feature_projection`: expected a boolean, "
             f"got {cfg['separate_feature_projection']!r}"
+        )
+    if not isinstance(cfg["recurrent_batching"], str) or cfg["recurrent_batching"] not in {
+        "legacy",
+        "packed",
+    }:
+        raise ValueError(
+            "Invalid `network.gru.recurrent_batching`: expected 'legacy' or 'packed', "
+            f"got {cfg['recurrent_batching']!r}"
         )
     return cfg
 

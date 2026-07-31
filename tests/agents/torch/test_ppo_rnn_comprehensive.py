@@ -673,6 +673,36 @@ def test_sequences_are_complete_shuffled_each_epoch_and_cover_every_sample_once(
     assert len(set(epoch_partitions)) > 1
 
 
+def test_each_recurrent_minibatch_uses_one_consolidated_memory_gather():
+    rollouts, sequence_length, num_envs = 8, 2, 3
+    learning_epochs, mini_batches = 3, 4
+    agent = _make_agent(
+        rollouts=rollouts,
+        num_envs=num_envs,
+        policy_sequence_length=sequence_length,
+        learning_epochs=learning_epochs,
+        mini_batches=mini_batches,
+    )
+    _collect(agent, rollouts=rollouts, num_envs=num_envs)
+
+    calls = []
+    original_sample_by_index = agent.memory.sample_by_index
+
+    def recording_sample_by_index(names, *, indexes, mini_batches=1):
+        calls.append((tuple(names), torch.as_tensor(indexes).clone()))
+        return original_sample_by_index(
+            names, indexes=indexes, mini_batches=mini_batches
+        )
+
+    agent.memory.sample_by_index = recording_sample_by_index
+    agent.enable_models_training_mode(True)
+    agent.update(timestep=rollouts - 1, timesteps=rollouts)
+
+    assert len(calls) == learning_epochs * mini_batches
+    expected_names = tuple([*agent._tensors_names, *agent._rnn_tensors_names])
+    assert all(names == expected_names for names, _ in calls)
+
+
 def test_sequence_kl_early_stop_preserves_boundaries_and_ends_the_complete_update():
     rollouts, sequence_length, num_envs = 8, 2, 3
     agent = _make_agent(
@@ -1409,7 +1439,12 @@ def _multimodal_space() -> gymnasium.spaces.Dict:
     )
 
 
-def _multimodal_network(sequence_length: int) -> dict[str, Any]:
+def _multimodal_network(
+    sequence_length: int,
+    *,
+    recurrent_batching: str = "packed",
+    num_layers: int = 1,
+) -> dict[str, Any]:
     return {
         "cnn": {
             "channels": [2],
@@ -1420,7 +1455,12 @@ def _multimodal_network(sequence_length: int) -> dict[str, Any]:
         },
         "ego": {"fusion_dim": 3},
         "attention": {"embed_dim": 2, "num_heads": 1},
-        "gru": {"hidden_size": 4, "num_layers": 1, "sequence_length": sequence_length},
+        "gru": {
+            "hidden_size": 4,
+            "num_layers": num_layers,
+            "sequence_length": sequence_length,
+            "recurrent_batching": recurrent_batching,
+        },
         "mlp": {"hidden_dims": [4], "use_layernorm": False, "activation": "relu"},
     }
 
@@ -1436,6 +1476,405 @@ def _multimodal_samples(rollouts: int, num_envs: int, *, offset: float) -> torch
         "others_mask": torch.ones((count, 2)),
     }
     return flatten_tensorized_space(native).view(rollouts, num_envs, -1)
+
+
+def test_packed_gru_reset_batching_matches_legacy_outputs_and_gradients():
+    sequence_count, sequence_length = 7, 8
+    observation_space = _multimodal_space()
+    action_space = gymnasium.spaces.Box(-1, 1, shape=(2,))
+    torch.manual_seed(1907)
+    legacy = CNNGRUAttentionMLPPolicy(
+        observation_space=observation_space,
+        state_space=observation_space,
+        action_space=action_space,
+        device="cpu",
+        num_envs=sequence_count,
+        network=_multimodal_network(
+            sequence_length, recurrent_batching="legacy"
+        ),
+        reduction="sum",
+    )
+    packed = CNNGRUAttentionMLPPolicy(
+        observation_space=observation_space,
+        state_space=observation_space,
+        action_space=action_space,
+        device="cpu",
+        num_envs=sequence_count,
+        network=_multimodal_network(
+            sequence_length, recurrent_batching="packed"
+        ),
+        reduction="sum",
+    )
+    packed.load_state_dict(legacy.state_dict())
+    legacy.train()
+    packed.train()
+
+    done = torch.zeros((sequence_count, sequence_length), dtype=torch.bool)
+    # The union contains every internal boundary, including consecutive done
+    # transitions and a final-step reset.
+    for row, step in enumerate(range(sequence_length - 1)):
+        done[row, step] = True
+    done[2, 3] = True
+    done[3, -1] = True
+    truncated = torch.zeros_like(done)
+    truncated[5, 4] = True
+
+    base_features = torch.randn(
+        sequence_count * sequence_length, legacy.hidden_size
+    )
+    stored_hidden = torch.randn(
+        legacy.num_layers,
+        sequence_count * sequence_length,
+        legacy.hidden_size,
+    )
+
+    def run(model, features):
+        calls = 0
+
+        def count_call(_module, _inputs, _outputs):
+            nonlocal calls
+            calls += 1
+
+        hook = model.gru.register_forward_hook(count_call)
+        try:
+            output, hidden = model._run_gru(
+                features,
+                {
+                    "rnn": [stored_hidden.clone()],
+                    "terminated": done.reshape(-1, 1),
+                    "truncated": truncated.reshape(-1, 1),
+                },
+            )
+            loss = output.float().square().mean() + hidden.float().square().mean()
+            loss.backward()
+        finally:
+            hook.remove()
+        gradients = {
+            name: parameter.grad.detach().clone()
+            for name, parameter in model.gru.named_parameters()
+        }
+        return output.detach(), hidden.detach(), features.grad.detach(), gradients, calls
+
+    legacy_features = base_features.clone().requires_grad_(True)
+    packed_features = base_features.clone().requires_grad_(True)
+    legacy_result = run(legacy, legacy_features)
+    packed_result = run(packed, packed_features)
+
+    for legacy_tensor, packed_tensor in zip(legacy_result[:3], packed_result[:3]):
+        torch.testing.assert_close(legacy_tensor, packed_tensor, rtol=1e-5, atol=1e-6)
+    for name in legacy_result[3]:
+        torch.testing.assert_close(
+            legacy_result[3][name], packed_result[3][name], rtol=1e-5, atol=1e-6
+        )
+    assert legacy_result[4] == sequence_length
+    assert packed_result[4] == 1
+    assert torch.count_nonzero(packed_result[1][:, done[:, -1], :]) == 0
+
+
+def _run_custom_gru_with_gradients(
+    model,
+    base_features: torch.Tensor,
+    stored_hidden: torch.Tensor,
+    done: torch.Tensor,
+    *,
+    stepwise_reference: bool,
+    mixed_precision: bool = False,
+):
+    """Run either the packed path or an independent one-step recurrence oracle."""
+    model.zero_grad(set_to_none=True)
+    features = base_features.detach().clone().requires_grad_(True)
+    calls = 0
+
+    def count_call(_module, _inputs, _outputs):
+        nonlocal calls
+        calls += 1
+
+    hook = model.gru.register_forward_hook(count_call)
+    try:
+        with torch.autocast(
+            device_type=features.device.type,
+            enabled=mixed_precision,
+        ):
+            if stepwise_reference:
+                sequence_count, sequence_length = done.shape
+                rnn_input = features.view(
+                    sequence_count, sequence_length, model.hidden_size
+                )
+                hidden = stored_hidden.view(
+                    model.num_layers,
+                    sequence_count,
+                    sequence_length,
+                    model.hidden_size,
+                )[:, :, 0, :].contiguous()
+                outputs = []
+                for step in range(sequence_length):
+                    output, hidden = model.gru(
+                        rnn_input[:, step : step + 1], hidden
+                    )
+                    outputs.append(output)
+                    hidden = hidden.masked_fill(
+                        done[:, step].view(1, -1, 1), 0
+                    )
+                output = torch.cat(outputs, dim=1).flatten(0, 1)
+            else:
+                output, hidden = model._run_gru(
+                    features,
+                    {
+                        "rnn": [stored_hidden.clone()],
+                        "terminated": done.reshape(-1, 1),
+                    },
+                )
+            loss = output.float().square().mean() + hidden.float().square().mean()
+        loss.backward()
+    finally:
+        hook.remove()
+
+    gradients = {
+        name: parameter.grad.detach().clone()
+        for name, parameter in model.gru.named_parameters()
+    }
+    return (
+        output.detach(),
+        hidden.detach(),
+        features.grad.detach(),
+        gradients,
+        calls,
+    )
+
+
+@pytest.mark.parametrize(
+    ("sequence_length", "num_layers"),
+    [(2, 1), (8, 2), (40, 3)],
+)
+def test_packed_gru_matches_independent_stepwise_oracle_for_random_done_masks(
+    sequence_length: int,
+    num_layers: int,
+):
+    """Exercise sparse, dense and adversarial resets without trusting legacy code."""
+    sequence_count = 9
+    observation_space = _multimodal_space()
+    action_space = gymnasium.spaces.Box(-1, 1, shape=(2,))
+    torch.manual_seed(2701 + sequence_length + num_layers)
+    reference = CNNGRUAttentionMLPPolicy(
+        observation_space=observation_space,
+        state_space=observation_space,
+        action_space=action_space,
+        device="cpu",
+        num_envs=sequence_count,
+        network=_multimodal_network(
+            sequence_length,
+            recurrent_batching="legacy",
+            num_layers=num_layers,
+        ),
+        reduction="sum",
+    )
+    packed = CNNGRUAttentionMLPPolicy(
+        observation_space=observation_space,
+        state_space=observation_space,
+        action_space=action_space,
+        device="cpu",
+        num_envs=sequence_count,
+        network=_multimodal_network(
+            sequence_length,
+            recurrent_batching="packed",
+            num_layers=num_layers,
+        ),
+        reduction="sum",
+    )
+    packed.load_state_dict(reference.state_dict())
+    reference.train()
+    packed.train()
+
+    generator = torch.Generator().manual_seed(3107 + sequence_length)
+    base_features = torch.randn(
+        sequence_count * sequence_length,
+        packed.hidden_size,
+        generator=generator,
+    )
+    stored_hidden = torch.randn(
+        num_layers,
+        sequence_count * sequence_length,
+        packed.hidden_size,
+        generator=generator,
+    )
+    masks = [
+        torch.zeros((sequence_count, sequence_length), dtype=torch.bool),
+        torch.ones((sequence_count, sequence_length), dtype=torch.bool),
+    ]
+    final_only = torch.zeros_like(masks[0])
+    final_only[:, -1] = True
+    masks.append(final_only)
+    every_boundary = torch.zeros_like(masks[0])
+    if sequence_length > 1:
+        rows = torch.arange(sequence_length - 1) % sequence_count
+        every_boundary[rows, torch.arange(sequence_length - 1)] = True
+    masks.append(every_boundary)
+    for probability in (0.01, 0.10, 0.50):
+        for seed in (17, 91):
+            random_generator = torch.Generator().manual_seed(
+                seed + sequence_length * 100
+            )
+            masks.append(
+                torch.rand(
+                    (sequence_count, sequence_length),
+                    generator=random_generator,
+                )
+                < probability
+            )
+
+    for done in masks:
+        reference_result = _run_custom_gru_with_gradients(
+            reference,
+            base_features,
+            stored_hidden,
+            done,
+            stepwise_reference=True,
+        )
+        packed_result = _run_custom_gru_with_gradients(
+            packed,
+            base_features,
+            stored_hidden,
+            done,
+            stepwise_reference=False,
+        )
+        for reference_tensor, packed_tensor in zip(
+            reference_result[:3], packed_result[:3]
+        ):
+            torch.testing.assert_close(
+                reference_tensor, packed_tensor, rtol=2e-5, atol=2e-6
+            )
+        for name in reference_result[3]:
+            torch.testing.assert_close(
+                reference_result[3][name],
+                packed_result[3][name],
+                rtol=2e-5,
+                atol=2e-6,
+            )
+        assert reference_result[4] == sequence_length
+        assert packed_result[4] == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.parametrize("mixed_precision", [False, True], ids=["fp32", "amp"])
+def test_cuda_packed_gru_matches_stepwise_outputs_hidden_and_gradients(
+    mixed_precision: bool,
+):
+    """Compare the deployed CUDA kernels, including backward, for two GRU layers."""
+    device = torch.device("cuda:0")
+    sequence_count, sequence_length, num_layers = 32, 40, 2
+    observation_space = _multimodal_space()
+    action_space = gymnasium.spaces.Box(-1, 1, shape=(2,))
+    torch.manual_seed(3301)
+    torch.cuda.manual_seed_all(3301)
+    reference = CNNGRUAttentionMLPPolicy(
+        observation_space=observation_space,
+        state_space=observation_space,
+        action_space=action_space,
+        device=device,
+        num_envs=sequence_count,
+        network=_multimodal_network(
+            sequence_length,
+            recurrent_batching="legacy",
+            num_layers=num_layers,
+        ),
+        reduction="sum",
+    )
+    packed = CNNGRUAttentionMLPPolicy(
+        observation_space=observation_space,
+        state_space=observation_space,
+        action_space=action_space,
+        device=device,
+        num_envs=sequence_count,
+        network=_multimodal_network(
+            sequence_length,
+            recurrent_batching="packed",
+            num_layers=num_layers,
+        ),
+        reduction="sum",
+    )
+    reference.to(device)
+    packed.to(device)
+    packed.load_state_dict(reference.state_dict())
+    reference.train()
+    packed.train()
+
+    generator = torch.Generator(device=device).manual_seed(3407)
+    base_features = torch.randn(
+        sequence_count * sequence_length,
+        packed.hidden_size,
+        generator=generator,
+        device=device,
+    )
+    stored_hidden = torch.randn(
+        num_layers,
+        sequence_count * sequence_length,
+        packed.hidden_size,
+        generator=generator,
+        device=device,
+    )
+    done = (
+        torch.rand(
+            (sequence_count, sequence_length),
+            generator=generator,
+            device=device,
+        )
+        < 0.05
+    )
+    rows = torch.arange(sequence_length - 1, device=device) % sequence_count
+    done[rows, torch.arange(sequence_length - 1, device=device)] = True
+
+    reference_result = _run_custom_gru_with_gradients(
+        reference,
+        base_features,
+        stored_hidden,
+        done,
+        stepwise_reference=True,
+        mixed_precision=mixed_precision,
+    )
+    packed_result = _run_custom_gru_with_gradients(
+        packed,
+        base_features,
+        stored_hidden,
+        done,
+        stepwise_reference=False,
+        mixed_precision=mixed_precision,
+    )
+    rtol, atol = ((5e-3, 2e-4) if not mixed_precision else (5e-2, 1e-3))
+    for reference_tensor, packed_tensor in zip(
+        reference_result[:3], packed_result[:3]
+    ):
+        assert torch.isfinite(reference_tensor).all()
+        assert torch.isfinite(packed_tensor).all()
+        torch.testing.assert_close(
+            reference_tensor.float(),
+            packed_tensor.float(),
+            rtol=rtol,
+            atol=atol,
+        )
+    for name in reference_result[3]:
+        assert torch.isfinite(reference_result[3][name]).all()
+        assert torch.isfinite(packed_result[3][name]).all()
+        torch.testing.assert_close(
+            reference_result[3][name].float(),
+            packed_result[3][name].float(),
+            rtol=rtol,
+            atol=atol,
+        )
+    assert reference_result[4] == sequence_length
+    assert packed_result[4] == 1
+
+
+def test_invalid_recurrent_batching_backend_is_rejected():
+    with pytest.raises(ValueError, match="recurrent_batching"):
+        CNNGRUAttentionMLPPolicy(
+            observation_space=_multimodal_space(),
+            state_space=_multimodal_space(),
+            action_space=gymnasium.spaces.Box(-1, 1, shape=(2,)),
+            device="cpu",
+            num_envs=2,
+            network=_multimodal_network(2, recurrent_batching="unknown"),
+            reduction="sum",
+        )
 
 
 def test_attention_fusion_receives_valid_ratio_derived_from_mask():
