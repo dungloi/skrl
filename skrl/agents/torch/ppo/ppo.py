@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 import itertools
+import math
 import gymnasium
 from packaging import version
 
@@ -22,6 +23,7 @@ from ._utils import (
     any_rank_true,
     ensure_full_rollout,
     require_finite,
+    require_finite_many,
     require_finite_model,
     synchronized_grad_scaler_step,
     validate_ppo_setup,
@@ -256,7 +258,11 @@ class PPO(Agent):
                 outputs = {**likelihood_outputs, **outputs, "log_prob": likelihood_outputs["log_prob"]}
             self._current_log_prob = outputs["log_prob"]
             validate_scalar_output(
-                "PPO policy log_prob", self._current_log_prob, observations.shape[0], synchronize=True
+                "PPO policy log_prob",
+                self._current_log_prob,
+                observations.shape[0],
+                synchronize=True,
+                check_finite=self.cfg.numerics_check_mode == "strict",
             )
             return actions, outputs
 
@@ -265,7 +271,11 @@ class PPO(Agent):
             actions, outputs = self.policy.act(inputs, role="policy")
             self._current_log_prob = outputs["log_prob"]
             validate_scalar_output(
-                "PPO policy log_prob", self._current_log_prob, observations.shape[0], synchronize=True
+                "PPO policy log_prob",
+                self._current_log_prob,
+                observations.shape[0],
+                synchronize=True,
+                check_finite=self.cfg.numerics_check_mode == "strict",
             )
 
         return actions, outputs
@@ -333,7 +343,13 @@ class PPO(Agent):
                     "states": self._state_preprocessor(states),
                 }
                 values, _ = self.value.act(inputs, role="value")
-                validate_scalar_output("PPO value", values, observations.shape[0], synchronize=True)
+                validate_scalar_output(
+                    "PPO value",
+                    values,
+                    observations.shape[0],
+                    synchronize=True,
+                    check_finite=self.cfg.numerics_check_mode == "strict",
+                )
                 values = self._value_preprocessor(values, inverse=True)
 
             # time-limit (truncation) bootstrapping
@@ -359,7 +375,11 @@ class PPO(Agent):
                     }
                     timeout_values, _ = self.value.act(next_inputs, role="value")
                     validate_scalar_output(
-                        "PPO timeout value", timeout_values, observations.shape[0], synchronize=True
+                        "PPO timeout value",
+                        timeout_values,
+                        observations.shape[0],
+                        synchronize=True,
+                        check_finite=self.cfg.numerics_check_mode == "strict",
                     )
                     timeout_values = self._value_preprocessor(timeout_values, inverse=True)
                 rewards = rewards + self.cfg.discount_factor * timeout_values * timeout_mask
@@ -422,22 +442,50 @@ class PPO(Agent):
         :param timestep: Current timestep.
         :param timesteps: Number of timesteps.
         """
+        strict_numerics = self.cfg.numerics_check_mode == "strict"
+        update_numerics = self.cfg.numerics_check_mode == "update"
         ensure_full_rollout(name="PPO", memory=self.memory, consumed=self._rollout_consumed)
-        require_finite_model("PPO policy", self.policy, synchronize=True)
-        if self.value is not self.policy:
-            require_finite_model("PPO value", self.value, synchronize=True)
-        require_finite(
-            "PPO rollout observations", self.memory.get_tensor_by_name("observations"), synchronize=True
-        )
-        require_finite("PPO rollout actions", self.memory.get_tensor_by_name("actions"), synchronize=True)
-        if "states" in self.memory.tensors:
-            require_finite("PPO rollout states", self.memory.get_tensor_by_name("states"), synchronize=True)
-        require_finite("PPO rollout rewards", self.memory.get_tensor_by_name("rewards"), synchronize=True)
-        require_finite("PPO rollout log_prob", self.memory.get_tensor_by_name("log_prob"), synchronize=True)
-        require_finite("PPO rollout values", self.memory.get_tensor_by_name("values"), synchronize=True)
-        require_finite("PPO next observations", self._current_next_observations, synchronize=True)
-        if self._current_next_states is not None:
-            require_finite("PPO next states", self._current_next_states, synchronize=True)
+        update_finite_tensors = []
+        if strict_numerics:
+            require_finite_model("PPO policy", self.policy, synchronize=True)
+            if self.value is not self.policy:
+                require_finite_model("PPO value", self.value, synchronize=True)
+            require_finite(
+                "PPO rollout observations", self.memory.get_tensor_by_name("observations"), synchronize=True
+            )
+            require_finite("PPO rollout actions", self.memory.get_tensor_by_name("actions"), synchronize=True)
+            if "states" in self.memory.tensors:
+                require_finite("PPO rollout states", self.memory.get_tensor_by_name("states"), synchronize=True)
+            require_finite("PPO rollout rewards", self.memory.get_tensor_by_name("rewards"), synchronize=True)
+            require_finite("PPO rollout log_prob", self.memory.get_tensor_by_name("log_prob"), synchronize=True)
+            require_finite("PPO rollout values", self.memory.get_tensor_by_name("values"), synchronize=True)
+            require_finite("PPO next observations", self._current_next_observations, synchronize=True)
+            if self._current_next_states is not None:
+                require_finite("PPO next states", self._current_next_states, synchronize=True)
+        elif update_numerics:
+            # Defer all update-input diagnostics to one device decision below.
+            # Shape contracts remain immediate at every model call.
+            for model in (self.policy, None if self.value is self.policy else self.value):
+                if model is None:
+                    continue
+                update_finite_tensors.extend(model.parameters())
+                update_finite_tensors.extend(
+                    buffer for buffer in model.buffers() if torch.is_floating_point(buffer)
+                )
+            update_finite_tensors.extend(
+                (
+                    self.memory.get_tensor_by_name("observations"),
+                    self.memory.get_tensor_by_name("actions"),
+                    self.memory.get_tensor_by_name("rewards"),
+                    self.memory.get_tensor_by_name("log_prob"),
+                    self.memory.get_tensor_by_name("values"),
+                    self._current_next_observations,
+                )
+            )
+            if "states" in self.memory.tensors:
+                update_finite_tensors.append(self.memory.get_tensor_by_name("states"))
+            if self._current_next_states is not None:
+                update_finite_tensors.append(self._current_next_states)
 
         # compute returns and advantages
         with torch.no_grad(), torch.autocast(device_type=self._device_type, enabled=self.cfg.mixed_precision):
@@ -449,7 +497,11 @@ class PPO(Agent):
             last_values, _ = self.value.act(inputs, role="value")
             self.value.enable_training_mode(True)
             validate_scalar_output(
-                "PPO last value", last_values, self._current_next_observations.shape[0], synchronize=True
+                "PPO last value",
+                last_values,
+                self._current_next_observations.shape[0],
+                synchronize=True,
+                check_finite=strict_numerics,
             )
             last_values = self._value_preprocessor(last_values, inverse=True)
 
@@ -463,8 +515,12 @@ class PPO(Agent):
             discount_factor=self.cfg.discount_factor,
             lambda_coefficient=self.cfg.lambda_,
         )
-        require_finite("PPO returns", returns, synchronize=True)
-        require_finite("PPO advantages", advantages, synchronize=True)
+        if strict_numerics:
+            require_finite("PPO returns", returns, synchronize=True)
+            require_finite("PPO advantages", advantages, synchronize=True)
+        elif update_numerics:
+            update_finite_tensors.extend((last_values, returns, advantages))
+            require_finite_many("PPO update inputs", update_finite_tensors, synchronize=True)
 
         # Keep value normalization in one frozen coordinate system for the complete PPO
         # update. In particular, old values, current predictions and return targets must be
@@ -488,20 +544,23 @@ class PPO(Agent):
                 for batch in torch.tensor_split(indexes, mini_batches)
             ]
 
-        cumulative_policy_loss = 0
-        cumulative_entropy_loss = 0
-        cumulative_value_loss = 0
-        cumulative_approx_kl = 0
-        cumulative_clip_fraction = 0
-        cumulative_clip_magnitude = 0
-        cumulative_is_ratio_sum = 0
-        cumulative_is_ratio_sumsq = 0
-        cumulative_entropy = 0
-        cumulative_value_clip_fraction = 0
-        cumulative_grad_norm = 0
-        finite_grad_norm_count = 0
-        gradient_overflow_count = 0
-        max_approx_kl = float("-inf")
+        # Keep update metrics on the device. Reading every scalar with ``.item()``
+        # serializes the CUDA stream once per metric and mini-batch; all values are
+        # transferred together after the update instead.
+        cumulative_policy_loss = torch.zeros((), dtype=torch.float64, device=self.device)
+        cumulative_entropy_loss = torch.zeros_like(cumulative_policy_loss)
+        cumulative_value_loss = torch.zeros_like(cumulative_policy_loss)
+        cumulative_approx_kl = torch.zeros_like(cumulative_policy_loss)
+        cumulative_clip_fraction = torch.zeros_like(cumulative_policy_loss)
+        cumulative_clip_magnitude = torch.zeros_like(cumulative_policy_loss)
+        cumulative_is_ratio_sum = torch.zeros_like(cumulative_policy_loss)
+        cumulative_is_ratio_sumsq = torch.zeros_like(cumulative_policy_loss)
+        cumulative_entropy = torch.zeros_like(cumulative_policy_loss)
+        cumulative_value_clip_fraction = torch.zeros_like(cumulative_policy_loss)
+        cumulative_grad_norm = torch.zeros_like(cumulative_policy_loss)
+        finite_grad_norm_count = torch.zeros_like(cumulative_policy_loss)
+        gradient_overflow_count = torch.zeros_like(cumulative_policy_loss)
+        max_approx_kl = torch.full_like(cumulative_policy_loss, float("-inf"))
         kl_early_stop_count = 0
         observed_minibatches = 0
         observed_samples = 0
@@ -509,19 +568,19 @@ class PPO(Agent):
         effective_samples = 0
         entropy_samples = 0
         explained_variance_samples = 0
-        explained_variance_returns_sum = 0
-        explained_variance_returns_sumsq = 0
-        explained_variance_residual_sum = 0
-        explained_variance_residual_sumsq = 0
+        explained_variance_returns_sum = torch.zeros_like(cumulative_policy_loss)
+        explained_variance_returns_sumsq = torch.zeros_like(cumulative_policy_loss)
+        explained_variance_residual_sum = torch.zeros_like(cumulative_policy_loss)
+        explained_variance_residual_sumsq = torch.zeros_like(cumulative_policy_loss)
         update_early_stop = False
         optimizer_steps = 0
-        initial_replay_max_abs_log_ratio = 0.0
+        initial_replay_max_abs_log_ratio = torch.zeros_like(cumulative_policy_loss)
 
         # learning epochs
         for epoch in range(self.cfg.learning_epochs):
             epoch_kl_sum = torch.zeros((), dtype=torch.float64, device=self.device)
             epoch_kl_samples = 0
-            epoch_optimizer_steps = 0
+            epoch_optimizer_steps = torch.zeros_like(cumulative_policy_loss)
             sampled_batches = sample_minibatches()
 
             # mini-batches loop
@@ -544,12 +603,17 @@ class PPO(Agent):
                     _, outputs = self.policy.act({**inputs, "taken_actions": sampled_actions}, role="policy")
                     next_log_prob = outputs["log_prob"]
                     validate_scalar_output(
-                        "PPO replay log_prob", next_log_prob, sampled_log_prob.shape[0], synchronize=True
+                        "PPO replay log_prob",
+                        next_log_prob,
+                        sampled_log_prob.shape[0],
+                        synchronize=True,
+                        check_finite=strict_numerics,
                     )
                     lower, upper = 1.0 - self.cfg.ratio_clip, 1.0 + self.cfg.ratio_clip
                     log_ratio = next_log_prob - sampled_log_prob
                     ratio = torch.exp(log_ratio)
-                    require_finite("PPO importance ratio", ratio, synchronize=True)
+                    if strict_numerics or not self.scaler.is_enabled():
+                        require_finite("PPO importance ratio", ratio, synchronize=True)
 
                     # compute approximate KL divergence
                     with torch.no_grad():
@@ -567,15 +631,14 @@ class PPO(Agent):
 
                     observed_minibatches += 1
                     if observed_minibatches == 1:
-                        initial_replay_max_abs_log_ratio = log_ratio_detached.abs().max().item()
-                    kl_value = kl_divergence.item()
+                        initial_replay_max_abs_log_ratio = log_ratio_detached.abs().max().double()
                     observed_samples += observed_batch_samples
-                    cumulative_approx_kl += kl_value * observed_batch_samples
-                    max_approx_kl = max(max_approx_kl, kl_value)
-                    cumulative_clip_fraction += clip_fraction.item() * observed_batch_samples
-                    cumulative_clip_magnitude += clip_magnitude.item() * observed_batch_samples
-                    cumulative_is_ratio_sum += is_ratio_sum.item()
-                    cumulative_is_ratio_sumsq += is_ratio_sumsq.item()
+                    cumulative_approx_kl += kl_divergence.double() * observed_batch_samples
+                    max_approx_kl = torch.maximum(max_approx_kl, kl_divergence.double())
+                    cumulative_clip_fraction += clip_fraction.double() * observed_batch_samples
+                    cumulative_clip_magnitude += clip_magnitude.double() * observed_batch_samples
+                    cumulative_is_ratio_sum += is_ratio_sum.double()
+                    cumulative_is_ratio_sumsq += is_ratio_sumsq.double()
 
                     # early stopping with KL divergence
                     should_early_stop = False
@@ -610,7 +673,11 @@ class PPO(Agent):
                     # compute value loss
                     predicted_values_raw, _ = self.value.act(inputs, role="value")
                     validate_scalar_output(
-                        "PPO replay value", predicted_values_raw, sampled_returns.shape[0], synchronize=True
+                        "PPO replay value",
+                        predicted_values_raw,
+                        sampled_returns.shape[0],
+                        synchronize=True,
+                        check_finite=strict_numerics,
                     )
 
                     with torch.no_grad():
@@ -618,10 +685,10 @@ class PPO(Agent):
                         predicted_values_detached = predicted_values_raw.detach().float()
                         residual_detached = returns_detached - predicted_values_detached
                         explained_variance_batch_samples = returns_detached.numel()
-                        explained_variance_returns_sum += returns_detached.sum().item()
-                        explained_variance_returns_sumsq += returns_detached.pow(2).sum().item()
-                        explained_variance_residual_sum += residual_detached.sum().item()
-                        explained_variance_residual_sumsq += residual_detached.pow(2).sum().item()
+                        explained_variance_returns_sum += returns_detached.sum().double()
+                        explained_variance_returns_sumsq += returns_detached.pow(2).sum().double()
+                        explained_variance_residual_sum += residual_detached.sum().double()
+                        explained_variance_residual_sumsq += residual_detached.pow(2).sum().double()
 
                     if self.cfg.value_clip > 0:
                         value_delta = predicted_values_raw - sampled_values
@@ -642,7 +709,8 @@ class PPO(Agent):
                         )
 
                     total_loss = policy_loss + entropy_loss + value_loss
-                    require_finite("PPO loss", total_loss, synchronize=True)
+                    if strict_numerics or not self.scaler.is_enabled():
+                        require_finite("PPO loss", total_loss, synchronize=True)
 
                 # optimization step
                 self.optimizer.zero_grad()
@@ -673,52 +741,65 @@ class PPO(Agent):
                 # model parameters (and synchronize that decision across workers).
                 if not self.scaler.is_enabled():
                     require_finite("PPO gradient norm", grad_norm, synchronize=True)
-                grad_norm_is_finite = bool(torch.isfinite(grad_norm).item())
+                grad_norm_is_finite = torch.isfinite(grad_norm)
                 optimizer_step_succeeded = synchronized_grad_scaler_step(
                     scaler=self.scaler, optimizer=self.optimizer, grad_norm=grad_norm
                 )
-                if self.scaler.is_enabled() and not optimizer_step_succeeded:
-                    gradient_overflow_count += 1
-                if optimizer_step_succeeded:
-                    epoch_optimizer_steps += 1
-                    optimizer_steps += 1
+                optimizer_step_succeeded = torch.as_tensor(
+                    optimizer_step_succeeded,
+                    dtype=torch.bool,
+                    device=self.device,
+                )
+                if self.scaler.is_enabled():
+                    gradient_overflow_count += (~optimizer_step_succeeded).to(dtype=torch.float64)
+                epoch_optimizer_steps += optimizer_step_succeeded.to(dtype=torch.float64)
 
                 # update cumulative losses
-                cumulative_policy_loss += policy_loss.item()
-                cumulative_value_loss += value_loss.item()
+                cumulative_policy_loss += policy_loss.detach().double()
+                cumulative_value_loss += value_loss.detach().double()
                 if self.cfg.entropy_loss_scale:
-                    cumulative_entropy_loss += entropy_loss.item()
-                cumulative_entropy += entropy.item() * entropy_batch_samples
+                    cumulative_entropy_loss += entropy_loss.detach().double()
+                cumulative_entropy += entropy.detach().double() * entropy_batch_samples
                 entropy_samples += entropy_batch_samples
-                cumulative_value_clip_fraction += value_clip_fraction.item() * explained_variance_batch_samples
-                if grad_norm_is_finite:
-                    cumulative_grad_norm += grad_norm.item()
-                    finite_grad_norm_count += 1
+                cumulative_value_clip_fraction += value_clip_fraction.double() * explained_variance_batch_samples
+                cumulative_grad_norm += torch.where(
+                    grad_norm_is_finite,
+                    grad_norm.detach().double(),
+                    torch.zeros_like(cumulative_grad_norm),
+                )
+                finite_grad_norm_count += grad_norm_is_finite.to(dtype=torch.float64)
                 effective_minibatches += 1
                 effective_samples += explained_variance_batch_samples
                 explained_variance_samples += explained_variance_batch_samples
+
+            # One epoch-level transfer supplies both KL scheduler input and AMP
+            # step accounting. The native single-GPU GradScaler path therefore
+            # never needs a per-mini-batch host decision.
+            epoch_kl_stats = torch.stack(
+                (
+                    epoch_kl_sum,
+                    torch.tensor(float(epoch_kl_samples), dtype=torch.float64, device=self.device),
+                )
+            )
+            if config.torch.is_distributed:
+                torch.distributed.all_reduce(epoch_kl_stats, op=torch.distributed.ReduceOp.SUM)
+            epoch_kl_sum_value, epoch_kl_samples_value, epoch_optimizer_steps_value = torch.cat(
+                (epoch_kl_stats, epoch_optimizer_steps.reshape(1))
+            ).detach().cpu().tolist()
+            epoch_optimizer_steps_count = int(round(epoch_optimizer_steps_value))
+            optimizer_steps += epoch_optimizer_steps_count
 
             # update learning rate
             if self.scheduler:
                 # A terminal KL at the start of an epoch can be the first observation of the
                 # preceding epoch's final optimizer step, so report it once to KLAdaptiveLR.
                 if isinstance(self.scheduler, KLAdaptiveLR) and (
-                    epoch_optimizer_steps or (update_early_stop and optimizer_steps > 0)
+                    epoch_optimizer_steps_count or (update_early_stop and optimizer_steps > 0)
                 ):
                     # Weight uneven mini-batches by their actual sample counts.
-                    if config.torch.is_distributed:
-                        stats = torch.stack(
-                            (
-                                epoch_kl_sum,
-                                torch.tensor(float(epoch_kl_samples), dtype=torch.float64, device=self.device),
-                            )
-                        )
-                        torch.distributed.all_reduce(stats, op=torch.distributed.ReduceOp.SUM)
-                        kl = stats[0] / stats[1].clamp_min(1)
-                    else:
-                        kl = epoch_kl_sum / max(epoch_kl_samples, 1)
-                    self.scheduler.step(kl.item())
-                elif epoch_optimizer_steps:
+                    kl = epoch_kl_sum_value / max(epoch_kl_samples_value, 1.0)
+                    self.scheduler.step(kl)
+                elif epoch_optimizer_steps_count:
                     self.scheduler.step()
 
             # a KL early-stop applies to the complete PPO update, not only to the current epoch
@@ -772,6 +853,80 @@ class PPO(Agent):
             else:
                 self._value_preprocessor(flat_returns, train=True)
 
+        # Collect every device metric with one batched device-to-host transfer.
+        policy_distribution = self.policy.distribution(role="policy")
+        policy_stddev = policy_distribution.stddev.float().mean().double()
+        try:
+            policy_probabilities = policy_distribution.probs
+        except (AttributeError, NotImplementedError):
+            policy_probabilities = None
+        policy_max_action_probability = (
+            policy_probabilities.float().amax(dim=-1).mean().double()
+            if policy_probabilities is not None
+            else torch.zeros_like(cumulative_policy_loss)
+        )
+        preprocessor_counts = []
+        for name, preprocessor in (
+            ("Observation", self._observation_preprocessor),
+            ("State", self._state_preprocessor),
+            ("Value", self._value_preprocessor),
+        ):
+            count = getattr(preprocessor, "current_count", None)
+            if count is not None:
+                preprocessor_counts.append(
+                    (name, count.detach().to(device=self.device, dtype=torch.float64))
+                )
+
+        metric_values = torch.stack(
+            (
+                cumulative_policy_loss,
+                cumulative_entropy_loss,
+                cumulative_value_loss,
+                cumulative_approx_kl,
+                cumulative_clip_fraction,
+                cumulative_clip_magnitude,
+                cumulative_is_ratio_sum,
+                cumulative_is_ratio_sumsq,
+                cumulative_entropy,
+                cumulative_value_clip_fraction,
+                cumulative_grad_norm,
+                finite_grad_norm_count,
+                gradient_overflow_count,
+                max_approx_kl,
+                explained_variance_returns_sum,
+                explained_variance_returns_sumsq,
+                explained_variance_residual_sum,
+                explained_variance_residual_sumsq,
+                initial_replay_max_abs_log_ratio,
+                policy_stddev,
+                policy_max_action_probability,
+                *(count for _, count in preprocessor_counts),
+            )
+        ).detach().cpu().tolist()
+        (
+            cumulative_policy_loss,
+            cumulative_entropy_loss,
+            cumulative_value_loss,
+            cumulative_approx_kl,
+            cumulative_clip_fraction,
+            cumulative_clip_magnitude,
+            cumulative_is_ratio_sum,
+            cumulative_is_ratio_sumsq,
+            cumulative_entropy,
+            cumulative_value_clip_fraction,
+            cumulative_grad_norm,
+            finite_grad_norm_count,
+            gradient_overflow_count,
+            max_approx_kl,
+            explained_variance_returns_sum,
+            explained_variance_returns_sumsq,
+            explained_variance_residual_sum,
+            explained_variance_residual_sumsq,
+            initial_replay_max_abs_log_ratio,
+            policy_stddev,
+            policy_max_action_probability,
+        ) = metric_values[:21]
+
         # record data
         observed_samples_safe = max(observed_samples, 1)
         effective_minibatches_safe = max(effective_minibatches, 1)
@@ -804,14 +959,12 @@ class PPO(Agent):
         self.track_data("Policy / IS ratio (mean)", is_ratio_mean)
         self.track_data("Policy / IS ratio (std)", is_ratio_var**0.5)
         self.track_data("Policy / Entropy", cumulative_entropy / entropy_samples_safe)
-        policy_distribution = self.policy.distribution(role="policy")
-        policy_stddev = policy_distribution.stddev.float().mean()
-        if torch.isfinite(policy_stddev):
-            self.track_data("Policy / Standard deviation", policy_stddev.item())
-        elif hasattr(policy_distribution, "probs"):
+        if math.isfinite(policy_stddev):
+            self.track_data("Policy / Standard deviation", policy_stddev)
+        elif policy_probabilities is not None:
             self.track_data(
                 "Policy / Maximum action probability",
-                policy_distribution.probs.float().amax(dim=-1).mean().item(),
+                policy_max_action_probability,
             )
         self.track_data("Value / Explained variance", explained_variance)
         self.track_data("Value / Clip fraction", cumulative_value_clip_fraction / effective_samples_safe)
@@ -825,14 +978,8 @@ class PPO(Agent):
         self.track_data("Optimization / Effective samples", effective_samples)
         self.track_data("Policy / Initial replay max abs log-ratio", initial_replay_max_abs_log_ratio)
 
-        for name, preprocessor in (
-            ("Observation", self._observation_preprocessor),
-            ("State", self._state_preprocessor),
-            ("Value", self._value_preprocessor),
-        ):
-            count = getattr(preprocessor, "current_count", None)
-            if count is not None:
-                self.track_data(f"Preprocessor / {name} sample count", float(count.item()))
+        for (name, _), count in zip(preprocessor_counts, metric_values[21:]):
+            self.track_data(f"Preprocessor / {name} sample count", count)
 
         learning_rates = (
             self.scheduler.get_last_lr()

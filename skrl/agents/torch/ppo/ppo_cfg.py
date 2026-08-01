@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Callable
+from typing import Callable, Literal
 
 import dataclasses
 
@@ -156,6 +156,15 @@ class PPO_CFG(AgentCfg):
 
     mixed_precision: bool = False
     """Whether to enable automatic mixed precision for higher performance."""
+
+    numerics_check_mode: Literal["strict", "update", "off"] = "strict"
+    """Numerical validation mode.
+
+    ``"strict"`` checks every model call and minibatch immediately. ``"update"``
+    performs finite checks at rollout/update boundaries while retaining all guards
+    required to protect optimizer state. ``"off"`` keeps only optimizer-safety
+    checks. Shape and recurrent-state structure checks are always enabled.
+    """
 
     def expand(self) -> None:
         """Expand the configuration."""

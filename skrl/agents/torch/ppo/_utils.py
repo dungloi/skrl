@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Iterable
 from typing import Any
 
 import torch
@@ -41,6 +42,11 @@ def validate_ppo_setup(*, name: str, cfg: Any, policy: Any, value: Any, memory: 
         value_ = getattr(cfg, field)
         if not isinstance(value_, bool):
             raise ValueError(f"{name} {field} must be a boolean, got {value_!r}")
+    if cfg.numerics_check_mode not in ("strict", "update", "off"):
+        raise ValueError(
+            f"{name} numerics_check_mode must be 'strict', 'update' or 'off', "
+            f"got {cfg.numerics_check_mode!r}"
+        )
 
     discount_factor = _finite_float(f"{name} discount_factor", cfg.discount_factor)
     lambda_ = _finite_float(f"{name} lambda_", cfg.lambda_)
@@ -106,7 +112,8 @@ def _any_rank_failed(local_failure: torch.Tensor, *, synchronize: bool) -> tuple
     local_failed = bool(local_failure.item())
     if synchronize and config.torch.is_distributed:
         torch.distributed.all_reduce(local_failure, op=torch.distributed.ReduceOp.MAX)
-    return bool(local_failure.item()), local_failed
+        return bool(local_failure.item()), local_failed
+    return local_failed, local_failed
 
 
 def _raise_if_any_rank_failed(name: str, local_failure: torch.Tensor, *, synchronize: bool) -> None:
@@ -124,6 +131,30 @@ def require_finite(name: str, tensor: torch.Tensor, *, synchronize: bool = False
         torch.logical_not(torch.isfinite(tensor).all()).to(dtype=torch.int32),
         synchronize=synchronize,
     )
+
+
+def require_finite_many(
+    name: str, tensors: Iterable[torch.Tensor], *, synchronize: bool = False
+) -> None:
+    """Validate a tensor collection with one device-to-host decision.
+
+    This is intended for update-boundary diagnostics, where reporting the exact
+    first tensor is less useful than avoiding a separate CUDA synchronization for
+    every model parameter and rollout buffer.
+    """
+
+    tensors = tuple(tensor for tensor in tensors if isinstance(tensor, torch.Tensor))
+    if not tensors:
+        return
+    device = tensors[0].device
+    local_failure = torch.zeros((), dtype=torch.int32, device=device)
+    for tensor in tensors:
+        tensor_failed = torch.logical_not(torch.isfinite(tensor).all())
+        local_failure = torch.maximum(
+            local_failure,
+            tensor_failed.to(device=device, dtype=torch.int32),
+        )
+    _raise_if_any_rank_failed(name, local_failure, synchronize=synchronize)
 
 
 def require_finite_model(name: str, model: Any, *, synchronize: bool = False) -> None:
@@ -161,7 +192,7 @@ def any_rank_true(value: torch.Tensor) -> bool:
 
 def synchronized_grad_scaler_step(
     *, scaler: Any, optimizer: torch.optim.Optimizer, grad_norm: torch.Tensor
-) -> bool:
+) -> bool | torch.Tensor:
     """Execute an optimizer step only when every distributed worker has finite gradients.
 
     The caller must unscale the optimizer and compute ``grad_norm`` before calling this
@@ -175,7 +206,15 @@ def synchronized_grad_scaler_step(
     carrying an infinite sentinel gradient records the global overflow through GradScaler's
     public API, so all workers apply the same backoff and reset their growth tracker.
 
-    :return: Whether the real optimizer step was executed successfully.
+    On a single device, PyTorch's native GradScaler already records ``found_inf``
+    on-device. Return a scalar tensor in that common path so callers can batch
+    optimizer-success accounting with their epoch statistics instead of forcing
+    another host decision per mini-batch. Distributed execution still returns a
+    Python boolean because every rank must take the same branch before mutation.
+
+    :return: Whether the real optimizer step was executed successfully, as a
+        device boolean on the native single-device AMP path and a Python boolean
+        otherwise.
     """
 
     scaler_enabled = scaler.is_enabled()
@@ -185,6 +224,54 @@ def synchronized_grad_scaler_step(
         scaler.step(optimizer)
         scaler.update()
         return True
+
+    native_grad_scaler_types = tuple(
+        scaler_type
+        for scaler_type in (
+            getattr(torch.amp, "GradScaler", None),
+            getattr(torch.cuda.amp, "GradScaler", None),
+        )
+        if isinstance(scaler_type, type)
+    )
+    if not config.torch.is_distributed and isinstance(scaler, native_grad_scaler_types):
+        # ``unscale_`` has already populated GradScaler's per-optimizer
+        # ``found_inf`` tensors. Native GradScaler consumes those tensors in
+        # ``step``/``update``; fused optimizers keep the complete skip/backoff
+        # decision on the GPU. The total gradient norm is finite exactly when
+        # the unscaled gradient collection is finite and doubles as an async
+        # success metric for the caller.
+        optimizer_step_allowed = torch.isfinite(grad_norm).all().detach()
+        optimizer_state = getattr(scaler, "_per_optimizer_states", {}).get(id(optimizer))
+        found_inf_per_device = (
+            optimizer_state.get("found_inf_per_device", {})
+            if isinstance(optimizer_state, dict)
+            else {}
+        )
+        if not found_inf_per_device:
+            raise RuntimeError(
+                "Native GradScaler did not expose found_inf state after unscale_; "
+                "call scaler.unscale_(optimizer) before synchronized_grad_scaler_step"
+            )
+        # GradScaler checks scaled gradients while unscaling. With a scale below
+        # one, a finite scaled gradient can itself overflow during division. Fold
+        # the post-unscale norm decision back into every found_inf tensor so both
+        # fused and regular optimizers skip that step without a host branch.
+        for found_inf in found_inf_per_device.values():
+            optimizer_step_allowed = torch.logical_and(
+                optimizer_step_allowed,
+                torch.logical_not(found_inf.bool().any()).to(device=optimizer_step_allowed.device),
+            )
+        overflow = torch.logical_not(optimizer_step_allowed)
+        for found_inf in found_inf_per_device.values():
+            found_inf.copy_(
+                torch.maximum(
+                    found_inf,
+                    overflow.to(device=found_inf.device, dtype=found_inf.dtype),
+                )
+            )
+        scaler.step(optimizer)
+        scaler.update()
+        return optimizer_step_allowed
 
     scale_before_step = float(scaler.get_scale())
     local_scale_is_valid = math.isfinite(scale_before_step) and scale_before_step > 0
@@ -237,10 +324,31 @@ def synchronized_grad_scaler_step(
 
 
 def validate_scalar_output(
-    name: str, tensor: torch.Tensor, batch_size: int, *, synchronize: bool = False
+    name: str,
+    tensor: torch.Tensor,
+    batch_size: int,
+    *,
+    synchronize: bool = False,
+    check_finite: bool = True,
 ) -> None:
     expected_shape = (batch_size, 1)
     local_shape_failed = tensor.shape != expected_shape
+    if not check_finite and not (synchronize and config.torch.is_distributed):
+        if local_shape_failed:
+            raise ValueError(f"{name} must have shape {expected_shape}, got {tuple(tensor.shape)}")
+        return
+
+    if not check_finite:
+        failure_code = torch.tensor(
+            2 * int(local_shape_failed), dtype=torch.int32, device=tensor.device
+        )
+        torch.distributed.all_reduce(failure_code, op=torch.distributed.ReduceOp.MAX)
+        global_failure_code = int(failure_code.item())
+        if global_failure_code:
+            actual = tuple(tensor.shape) if local_shape_failed else "invalid on another distributed rank"
+            raise ValueError(f"{name} must have shape {expected_shape}, got {actual}")
+        return
+
     local_finite_failed = not torch.isfinite(tensor).all().item()
     # One collective covers both contracts. Shape errors have priority because a
     # malformed scalar output may also make a finite check misleading.
@@ -267,6 +375,7 @@ def validate_rnn_output(
     expected_states: list[torch.Tensor],
     *,
     synchronize: bool = False,
+    check_finite: bool = True,
 ) -> list[torch.Tensor]:
     """Validate the number, shape and finiteness of live recurrent states."""
 
@@ -281,8 +390,13 @@ def validate_rnn_output(
             if not isinstance(actual, torch.Tensor) or actual.shape != expected.shape:
                 shape_failed = True
                 continue
-            if not torch.isfinite(actual).all().item():
+            if check_finite and not torch.isfinite(actual).all().item():
                 finite_failed = True
+
+    if not check_finite and not (synchronize and config.torch.is_distributed):
+        if shape_failed:
+            raise ValueError(f"{name} has an invalid recurrent-state count or shape")
+        return list(actual_states)
 
     failure_code = torch.tensor(
         2 * int(shape_failed) + int(finite_failed),

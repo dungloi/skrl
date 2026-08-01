@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple
 
 import gymnasium
 import torch
@@ -51,6 +51,36 @@ _CNN_GRU_ATTENTION_MLP_SPACE_PRIORITY: dict[str, tuple[str, ...]] = {
     "observation_space": ("image", "ego", "others_mask"),
     "state_space": ("image", "ego", "others_mask"),
 }
+
+# ``PPO_RNN`` treats model-prepared recurrent inputs as opaque values. Keep the
+# key private to this model family so other recurrent implementations can use
+# their own batching plans without depending on this representation.
+_PACKED_GRU_PLAN_INPUT = "_cnn_gru_attention_mlp_packed_plan"
+
+
+class _DenseGRUBatchPlan(NamedTuple):
+    """Replay metadata for a mini-batch without an internal episode boundary."""
+
+    sequence_count: int
+    sequence_length: int
+    final_done: torch.Tensor | None
+
+
+class _PackedGRUBatchPlan(NamedTuple):
+    """Episode-fragment indexes shared by policy and value replay forwards."""
+
+    sequence_count: int
+    sequence_length: int
+    segment_count: int
+    max_segment_length: int
+    segment_rows: torch.Tensor
+    safe_segment_steps: torch.Tensor
+    valid_steps: torch.Tensor
+    segment_lengths_cpu: torch.Tensor
+    first_segment_ids: torch.Tensor
+    flat_positions: torch.Tensor
+    last_segment_ids: torch.Tensor
+    final_done: torch.Tensor
 
 
 def _parse_other_shape(other_shape: tuple[int, ...]) -> tuple[int, int]:
@@ -332,6 +362,109 @@ class _CNNGRUAttentionMLPCommon:
             }
         }
 
+    def prepare_recurrent_batch(self, inputs: dict[str, Any]) -> dict[str, Any]:
+        """Prepare replay-only GRU indexes for reuse by policy and value models.
+
+        The returned mapping is intentionally opaque to the agent. Its tensors
+        depend only on the sampled done flags and sequence length, never on a
+        model's features, hidden size, number of layers, or floating-point
+        dtype. Separate actor and critic models can therefore consume the same
+        immutable plan safely.
+        """
+        if not self.training or self.recurrent_batching != "packed":
+            return {}
+        if _PACKED_GRU_PLAN_INPUT in inputs:
+            # Explicitly accept a compatible plan prepared by the other role.
+            # Returning the same object lets PPO_RNN keep model-private inputs
+            # away from unrelated or strict third-party recurrent models.
+            return {_PACKED_GRU_PLAN_INPUT: inputs[_PACKED_GRU_PLAN_INPUT]}
+
+        done = _merge_done_flags(inputs)
+        if done is None:
+            return {
+                _PACKED_GRU_PLAN_INPUT: _DenseGRUBatchPlan(
+                    sequence_count=0,
+                    sequence_length=self.sequence_length,
+                    final_done=None,
+                )
+            }
+        if done.numel() % self.sequence_length:
+            raise ValueError(
+                "Invalid recurrent done batch size: expected number of samples to be divisible by "
+                f"`sequence_length={self.sequence_length}`, got {done.numel()}"
+            )
+
+        done = done.view(-1, self.sequence_length)
+        sequence_count = done.shape[0]
+        # Preserve the dense fast path and its numerical behavior. This is the
+        # only data-dependent host decision in planning, and is now made once
+        # per mini-batch rather than independently by actor and critic.
+        if not bool(done[:, :-1].any().item()):
+            return {
+                _PACKED_GRU_PLAN_INPUT: _DenseGRUBatchPlan(
+                    sequence_count=sequence_count,
+                    sequence_length=self.sequence_length,
+                    final_done=done[:, -1],
+                )
+            }
+
+        return {_PACKED_GRU_PLAN_INPUT: self._build_packed_gru_plan(done)}
+
+    def _build_packed_gru_plan(self, done: torch.Tensor) -> _PackedGRUBatchPlan:
+        """Build all episode-fragment metadata that is independent of GRU inputs."""
+        sequence_count, sequence_length = done.shape
+        starts = torch.zeros_like(done, dtype=torch.bool)
+        starts[:, 0] = True
+        starts[:, 1:] = done[:, :-1]
+        segment_rows, segment_starts = starts.nonzero(as_tuple=True)
+        segment_count = segment_rows.shape[0]
+
+        next_rows = torch.empty_like(segment_rows)
+        next_starts = torch.empty_like(segment_starts)
+        next_rows[:-1] = segment_rows[1:]
+        next_starts[:-1] = segment_starts[1:]
+        next_rows[-1] = -1
+        next_starts[-1] = sequence_length
+        segment_ends = torch.where(
+            next_rows == segment_rows,
+            next_starts,
+            torch.full_like(segment_starts, sequence_length),
+        )
+        segment_lengths = segment_ends - segment_starts
+        # ``pack_padded_sequence`` requires CPU lengths. Derive the Python max
+        # from that same transfer instead of introducing a second GPU sync.
+        segment_lengths_cpu = segment_lengths.detach().to(device="cpu")
+        max_segment_length = int(segment_lengths_cpu.max().item())
+
+        offsets = torch.arange(max_segment_length, device=done.device)
+        segment_steps = segment_starts.unsqueeze(1) + offsets.unsqueeze(0)
+        valid_steps = offsets.unsqueeze(0) < segment_lengths.unsqueeze(1)
+        safe_segment_steps = segment_steps.clamp_max(sequence_length - 1)
+        first_segment_ids = (segment_starts == 0).nonzero(as_tuple=True)[0]
+        flat_positions = (
+            segment_rows.unsqueeze(1) * sequence_length + safe_segment_steps
+        )[valid_steps]
+
+        last_segment = torch.ones(
+            segment_count, dtype=torch.bool, device=segment_rows.device
+        )
+        last_segment[:-1] = segment_rows[:-1] != segment_rows[1:]
+        last_segment_ids = last_segment.nonzero(as_tuple=True)[0]
+        return _PackedGRUBatchPlan(
+            sequence_count=sequence_count,
+            sequence_length=sequence_length,
+            segment_count=segment_count,
+            max_segment_length=max_segment_length,
+            segment_rows=segment_rows,
+            safe_segment_steps=safe_segment_steps,
+            valid_steps=valid_steps,
+            segment_lengths_cpu=segment_lengths_cpu,
+            first_segment_ids=first_segment_ids,
+            flat_positions=flat_positions,
+            last_segment_ids=last_segment_ids,
+            final_done=done[:, -1],
+        )
+
     def _run_gru(
         self, step_features: torch.Tensor, inputs: dict[str, Any]
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -367,24 +500,50 @@ class _CNNGRUAttentionMLPCommon:
             # 只保留每段序列起始位置对应的 hidden state
             hidden_states = hidden_states[:, :, 0, :].contiguous()
 
-            # 若序列中间存在 done，则在 episode 边界后重置对应 hidden state
-            done = _merge_done_flags(inputs)
-            done = done.view(-1, self.sequence_length) if done is not None else None
-            has_internal_done = done is not None and bool(done[:, :-1].any().item())
-            if has_internal_done and self.recurrent_batching == "legacy":
-                rnn_output, hidden_states = self._run_gru_with_resets_legacy(
-                    rnn_input, hidden_states, done
-                )
-            elif has_internal_done:
-                rnn_output, hidden_states = self._run_gru_with_resets_packed(
-                    rnn_input, hidden_states, done
-                )
-            else:
-                rnn_output, hidden_states = self.gru(rnn_input, hidden_states)
-                if done is not None:
-                    hidden_states = hidden_states.masked_fill(
-                        done[:, -1].view(1, -1, 1), 0
+            # 若 PPO_RNN 已为 actor/critic 构造共享 plan，直接消费它，避免
+            # 两个模型重复分析同一份 done tensor。直接调用模型时仍走旧路径。
+            prepared_plan = inputs.get(_PACKED_GRU_PLAN_INPUT)
+            if self.recurrent_batching == "packed" and isinstance(
+                prepared_plan, (_DenseGRUBatchPlan, _PackedGRUBatchPlan)
+            ):
+                if prepared_plan.sequence_length != self.sequence_length:
+                    raise ValueError(
+                        "Packed GRU plan sequence length does not match model sequence length "
+                        f"({prepared_plan.sequence_length} != {self.sequence_length})"
                     )
+                if prepared_plan.sequence_count not in (0, rnn_input.shape[0]):
+                    raise ValueError(
+                        "Packed GRU plan sequence count does not match recurrent input "
+                        f"({prepared_plan.sequence_count} != {rnn_input.shape[0]})"
+                    )
+                if isinstance(prepared_plan, _PackedGRUBatchPlan):
+                    rnn_output, hidden_states = self._run_gru_with_resets_packed(
+                        rnn_input, hidden_states, plan=prepared_plan
+                    )
+                else:
+                    rnn_output, hidden_states = self.gru(rnn_input, hidden_states)
+                    if prepared_plan.final_done is not None:
+                        hidden_states = hidden_states.masked_fill(
+                            prepared_plan.final_done.view(1, -1, 1), 0
+                        )
+            else:
+                done = _merge_done_flags(inputs)
+                done = done.view(-1, self.sequence_length) if done is not None else None
+                has_internal_done = done is not None and bool(done[:, :-1].any().item())
+                if has_internal_done and self.recurrent_batching == "legacy":
+                    rnn_output, hidden_states = self._run_gru_with_resets_legacy(
+                        rnn_input, hidden_states, done
+                    )
+                elif has_internal_done:
+                    rnn_output, hidden_states = self._run_gru_with_resets_packed(
+                        rnn_input, hidden_states, done=done
+                    )
+                else:
+                    rnn_output, hidden_states = self.gru(rnn_input, hidden_states)
+                    if done is not None:
+                        hidden_states = hidden_states.masked_fill(
+                            done[:, -1].view(1, -1, 1), 0
+                        )
         # rollout 阶段每次只处理一个时间步，因此 sequence_length = 1
         else:
             rnn_input = step_features.view(-1, 1, step_features.shape[-1])
@@ -419,7 +578,9 @@ class _CNNGRUAttentionMLPCommon:
         self,
         rnn_input: torch.Tensor,
         hidden_states: torch.Tensor,
-        done: torch.Tensor,
+        done: torch.Tensor | None = None,
+        *,
+        plan: _PackedGRUBatchPlan | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Replay all episode fragments with one packed GRU invocation.
 
@@ -427,50 +588,35 @@ class _CNNGRUAttentionMLPCommon:
         consumed by the next transition. Splitting at ``done[:, :-1]`` preserves
         that recurrence while batching fragments from all sequences together.
         """
+        if plan is None:
+            if done is None:
+                raise ValueError("Packed GRU replay requires done flags or a prepared plan")
+            plan = self._build_packed_gru_plan(done)
         sequence_count, sequence_length, _ = rnn_input.shape
-        starts = torch.zeros_like(done, dtype=torch.bool)
-        starts[:, 0] = True
-        starts[:, 1:] = done[:, :-1]
-        segment_rows, segment_starts = starts.nonzero(as_tuple=True)
-        segment_count = segment_rows.shape[0]
-
-        next_rows = torch.empty_like(segment_rows)
-        next_starts = torch.empty_like(segment_starts)
-        next_rows[:-1] = segment_rows[1:]
-        next_starts[:-1] = segment_starts[1:]
-        next_rows[-1] = -1
-        next_starts[-1] = sequence_length
-        segment_ends = torch.where(
-            next_rows == segment_rows,
-            next_starts,
-            torch.full_like(segment_starts, sequence_length),
-        )
-        segment_lengths = segment_ends - segment_starts
-        max_segment_length = int(segment_lengths.max().item())
-
-        offsets = torch.arange(max_segment_length, device=rnn_input.device)
-        segment_steps = segment_starts.unsqueeze(1) + offsets.unsqueeze(0)
-        valid_steps = offsets.unsqueeze(0) < segment_lengths.unsqueeze(1)
-        safe_segment_steps = segment_steps.clamp_max(sequence_length - 1)
+        if plan.sequence_count != sequence_count or plan.sequence_length != sequence_length:
+            raise ValueError(
+                "Packed GRU plan shape does not match recurrent input: "
+                f"plan=({plan.sequence_count}, {plan.sequence_length}), "
+                f"input=({sequence_count}, {sequence_length})"
+            )
         padded_input = rnn_input[
-            segment_rows.unsqueeze(1), safe_segment_steps
-        ].masked_fill(~valid_steps.unsqueeze(-1), 0)
+            plan.segment_rows.unsqueeze(1), plan.safe_segment_steps
+        ].masked_fill(~plan.valid_steps.unsqueeze(-1), 0)
 
         segment_hidden = hidden_states.new_zeros(
-            self.num_layers, segment_count, self.hidden_size
+            self.num_layers, plan.segment_count, self.hidden_size
         )
-        first_segment_ids = (segment_starts == 0).nonzero(as_tuple=True)[0]
         segment_hidden = segment_hidden.index_copy(
             1,
-            first_segment_ids,
+            plan.first_segment_ids,
             hidden_states.index_select(
-                1, segment_rows.index_select(0, first_segment_ids)
+                1, plan.segment_rows.index_select(0, plan.first_segment_ids)
             ),
         )
 
         packed_input = nn.utils.rnn.pack_padded_sequence(
             padded_input,
-            segment_lengths.detach().to(device="cpu"),
+            plan.segment_lengths_cpu,
             batch_first=True,
             enforce_sorted=False,
         )
@@ -478,30 +624,22 @@ class _CNNGRUAttentionMLPCommon:
         padded_output, _ = nn.utils.rnn.pad_packed_sequence(
             packed_output,
             batch_first=True,
-            total_length=max_segment_length,
+            total_length=plan.max_segment_length,
         )
 
         flat_output = padded_output.new_zeros(
             sequence_count * sequence_length, self.hidden_size
         )
-        flat_positions = (
-            segment_rows.unsqueeze(1) * sequence_length + safe_segment_steps
-        )[valid_steps]
         flat_output = flat_output.index_copy(
-            0, flat_positions, padded_output[valid_steps]
+            0, plan.flat_positions, padded_output[plan.valid_steps]
         )
         rnn_output = flat_output.view(
             sequence_count, sequence_length, self.hidden_size
         )
 
-        last_segment = torch.ones(
-            segment_count, dtype=torch.bool, device=segment_rows.device
-        )
-        last_segment[:-1] = segment_rows[:-1] != segment_rows[1:]
-        last_segment_ids = last_segment.nonzero(as_tuple=True)[0]
-        hidden_states = segment_final_hidden.index_select(1, last_segment_ids)
+        hidden_states = segment_final_hidden.index_select(1, plan.last_segment_ids)
         hidden_states = hidden_states.masked_fill(
-            done[:, -1].view(1, -1, 1), 0
+            plan.final_done.view(1, -1, 1), 0
         )
         return rnn_output, hidden_states
 
@@ -560,31 +698,29 @@ class _CNNGRUAttentionMLPCommon:
         if valid_ratio is not None:
             valid_ratio = valid_ratio.to(device=query.device, dtype=query.dtype)
         if key_padding_mask is None:
-            attention_output, _ = self.attention(query=query, key=other_key_value, value=other_key_value)
+            attention_output, _ = self.attention(
+                query=query,
+                key=other_key_value,
+                value=other_key_value,
+                need_weights=False,
+            )
         else:
-            valid_rows = ~all_masked
-            if torch.any(valid_rows):
-                valid_attention_output, _ = self.attention(
-                    query=query[valid_rows],
-                    key=other_key_value[valid_rows],
-                    value=other_key_value[valid_rows],
-                    key_padding_mask=key_padding_mask[valid_rows],
-                )
-                # Under autocast, MultiheadAttention can return fp16/bf16 even
-                # when its input tensor is fp32. Allocate from the result so
-                # masked-row backfilling always uses the same dtype.
-                attention_output = valid_attention_output.new_zeros(
-                    batch_size * other_history_length,
-                    1,
-                    valid_attention_output.shape[-1],
-                )
-                attention_output[valid_rows] = valid_attention_output
-            else:
-                attention_output = query.new_zeros(
-                    batch_size * other_history_length,
-                    1,
-                    query.shape[-1],
-                )
+            # MultiheadAttention produces NaNs when every key in a row is
+            # masked. Temporarily expose one key for those rows, run the whole
+            # batch without a CUDA-dependent Python branch, then zero their
+            # outputs (and therefore their gradients) exactly.
+            safe_key_padding_mask = key_padding_mask.clone()
+            safe_key_padding_mask[:, 0] &= ~all_masked
+            attention_output, _ = self.attention(
+                query=query,
+                key=other_key_value,
+                value=other_key_value,
+                key_padding_mask=safe_key_padding_mask,
+                need_weights=False,
+            )
+            attention_output = attention_output.masked_fill(
+                all_masked.view(-1, 1, 1), 0
+            )
         attention_output = attention_output.squeeze(1).reshape(batch_size, other_history_length, -1).reshape(
             batch_size, -1
         )

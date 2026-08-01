@@ -2260,6 +2260,8 @@ def test_deployment_shape_full_ppo_rnn_update_smoke(
             "value_loss_scale": 1.0,
             "time_limit_bootstrap": False,
             "mixed_precision": mixed_precision,
+            "numerics_check_mode": "update",
+            "optimizer_kwargs": {"fused": device.startswith("cuda")},
         }
     )
     agent = PPO_RNN(
@@ -2339,8 +2341,32 @@ def test_deployment_shape_full_ppo_rnn_update_smoke(
 
     policy_before = [parameter.detach().clone() for parameter in policy.parameters()]
     value_before = [parameter.detach().clone() for parameter in value.parameters()]
+    prepared_plan_counts = {"policy_built": 0, "value_reused": 0}
+    original_policy_prepare = policy.prepare_recurrent_batch
+    original_value_prepare = value.prepare_recurrent_batch
+
+    def counted_policy_prepare(inputs):
+        prepared = original_policy_prepare(inputs)
+        prepared_plan_counts["policy_built"] += bool(prepared)
+        return prepared
+
+    def counted_value_prepare(inputs):
+        prepared = original_value_prepare(inputs)
+        if prepared:
+            # A prepared mapping returned by the critic must be a view of the
+            # actor's namespaced inputs, not a freshly constructed plan.
+            assert all(key in inputs and inputs[key] is value for key, value in prepared.items())
+            prepared_plan_counts["value_reused"] += 1
+        return prepared
+
+    policy.prepare_recurrent_batch = counted_policy_prepare
+    value.prepare_recurrent_batch = counted_value_prepare
     agent.enable_models_training_mode(True)
-    agent.update(timestep=rollouts - 1, timesteps=rollouts)
+    try:
+        agent.update(timestep=rollouts - 1, timesteps=rollouts)
+    finally:
+        policy.prepare_recurrent_batch = original_policy_prepare
+        value.prepare_recurrent_batch = original_value_prepare
 
     record_property("deployment_name", deployment_name)
     record_property("configured_learning_epochs", agent.cfg.learning_epochs)
@@ -2363,6 +2389,12 @@ def test_deployment_shape_full_ppo_rnn_update_smoke(
     replay_tolerance = 5e-3 if mixed_precision else 2e-5
     assert agent.tracking_data["Policy / Initial replay max abs log-ratio"][-1] < replay_tolerance
     assert agent.tracking_data["Optimization / Effective minibatches"][-1] > 0
+    # Actor and critic receive the same opaque plan: policy prepares it once,
+    # while value returns the exact same namespaced object without rebuilding.
+    assert prepared_plan_counts == {
+        "policy_built": agent.tracking_data["Optimization / Observed minibatches"][-1],
+        "value_reused": agent.tracking_data["Optimization / Observed minibatches"][-1],
+    }
     assert agent.tracking_data["Optimization / Successful optimizer steps"][-1] > 0
     assert agent.scaler.is_enabled() is mixed_precision
     assert agent.tracking_data["Optimization / Gradient overflow count"][-1] >= 0

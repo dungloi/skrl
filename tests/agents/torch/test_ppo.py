@@ -223,6 +223,7 @@ def test_agent(
         "rewards_shaper": rewards_shaper,
         "time_limit_bootstrap": time_limit_bootstrap,
         "mixed_precision": get_test_mixed_precision(mixed_precision),
+        "numerics_check_mode": "strict",
         "experiment": {
             "directory": "",
             "experiment_name": "",

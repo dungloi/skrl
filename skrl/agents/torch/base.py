@@ -233,7 +233,7 @@ class Agent(ABC):
         if self.checkpoint_interval > 0:
             os.makedirs(os.path.join(self.experiment_dir, "checkpoints"), exist_ok=True)
 
-    def track_data(self, tag: str, value: float) -> None:
+    def track_data(self, tag: str, value: float | torch.Tensor) -> None:
         """Track data to TensorBoard.
 
         .. note::
@@ -241,8 +241,13 @@ class Agent(ABC):
             Currently only scalar data is supported.
 
         :param tag: Data identifier (e.g. 'Loss/Policy loss').
-        :param value: Value to track.
+        :param value: Value to track. Scalar tensors stay on their current device until
+            ``write_tracking_data`` batches the device-to-host transfer.
         """
+        if isinstance(value, torch.Tensor):
+            if value.numel() != 1:
+                raise ValueError(f"Tracked tensor '{tag}' must be scalar, got shape {tuple(value.shape)}")
+            value = value.detach().reshape(())
         self.tracking_data[tag].append(value)
 
     def write_tracking_data(self, *, timestep: int, timesteps: int) -> None:
@@ -251,13 +256,45 @@ class Agent(ABC):
         :param timestep: Current timestep.
         :param timesteps: Number of timesteps.
         """
-        for k, v in self.tracking_data.items():
-            if k.endswith("(min)"):
-                self.writer.add_scalar(tag=k, value=np.min(v), timestep=timestep)
-            elif k.endswith("(max)"):
-                self.writer.add_scalar(tag=k, value=np.max(v), timestep=timestep)
+        # Reduce scalar tensors on-device and transfer all tags for a device in one
+        # operation. Environment info can contain dozens of CUDA scalars per step;
+        # converting each one in ``track_data`` would serialize the complete rollout.
+        reduced: dict[str, float] = {}
+        pending_by_device: dict[torch.device, list[tuple[str, torch.Tensor]]] = collections.defaultdict(list)
+        for tag, values in self.tracking_data.items():
+            tensor_values = [value for value in values if isinstance(value, torch.Tensor)]
+            if not tensor_values:
+                if tag.endswith("(min)"):
+                    reduced[tag] = float(np.min(values))
+                elif tag.endswith("(max)"):
+                    reduced[tag] = float(np.max(values))
+                else:
+                    reduced[tag] = float(np.mean(values))
+                continue
+
+            device = tensor_values[0].device
+            stacked = torch.stack(
+                [
+                    value.detach().to(device=device, dtype=torch.float64).reshape(())
+                    if isinstance(value, torch.Tensor)
+                    else torch.as_tensor(value, device=device, dtype=torch.float64)
+                    for value in values
+                ]
+            )
+            if tag.endswith("(min)"):
+                scalar = stacked.amin()
+            elif tag.endswith("(max)"):
+                scalar = stacked.amax()
             else:
-                self.writer.add_scalar(tag=k, value=np.mean(v), timestep=timestep)
+                scalar = stacked.mean()
+            pending_by_device[device].append((tag, scalar))
+
+        for pending in pending_by_device.values():
+            host_values = torch.stack([scalar for _, scalar in pending]).cpu().tolist()
+            reduced.update((tag, value) for (tag, _), value in zip(pending, host_values))
+
+        for tag, value in reduced.items():
+            self.writer.add_scalar(tag=tag, value=value, timestep=timestep)
         # reset data containers
         self._track_rewards.clear()
         self._track_timesteps.clear()
@@ -376,9 +413,9 @@ class Agent(ABC):
                 self._cumulative_timesteps[finished_episodes] = 0
 
             # record data
-            self.tracking_data["Reward / Instantaneous reward (max)"].append(torch.max(rewards).item())
-            self.tracking_data["Reward / Instantaneous reward (min)"].append(torch.min(rewards).item())
-            self.tracking_data["Reward / Instantaneous reward (mean)"].append(torch.mean(rewards).item())
+            self.track_data("Reward / Instantaneous reward (max)", torch.max(rewards))
+            self.track_data("Reward / Instantaneous reward (min)", torch.min(rewards))
+            self.track_data("Reward / Instantaneous reward (mean)", torch.mean(rewards))
 
             if len(self._track_rewards):
                 track_rewards = np.array(self._track_rewards)
