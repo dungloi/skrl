@@ -698,11 +698,15 @@ class _CNNGRUAttentionMLPCommon:
         if valid_ratio is not None:
             valid_ratio = valid_ratio.to(device=query.device, dtype=query.dtype)
         if key_padding_mask is None:
+            # Keep the weight-producing MHA path even though the weights are discarded.
+            # ``need_weights=False`` dispatches to SDPA and changes recurrent PPO's
+            # numerical trajectory enough to trigger unstable first updates. AMP
+            # amplifies the difference, but FP32 training is affected as well.
             attention_output, _ = self.attention(
                 query=query,
                 key=other_key_value,
                 value=other_key_value,
-                need_weights=False,
+                need_weights=True,
             )
         else:
             # MultiheadAttention produces NaNs when every key in a row is
@@ -716,7 +720,7 @@ class _CNNGRUAttentionMLPCommon:
                 key=other_key_value,
                 value=other_key_value,
                 key_padding_mask=safe_key_padding_mask,
-                need_weights=False,
+                need_weights=True,
             )
             attention_output = attention_output.masked_fill(
                 all_masked.view(-1, 1, 1), 0

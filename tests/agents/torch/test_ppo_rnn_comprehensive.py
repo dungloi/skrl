@@ -1427,16 +1427,16 @@ def test_repeated_kl_early_stops_do_not_lock_observation_to_fixed_environment_pr
     assert observed_envs == set(range(num_envs))
 
 
-def _multimodal_space() -> gymnasium.spaces.Dict:
-    return gymnasium.spaces.Dict(
-        {
-            "image": gymnasium.spaces.Box(-10, 10, shape=(1, 3, 3), dtype=float),
-            "ego": gymnasium.spaces.Box(-10, 10, shape=(2,), dtype=float),
-            "other_0": gymnasium.spaces.Box(-10, 10, shape=(1, 2), dtype=float),
-            "other_1": gymnasium.spaces.Box(-10, 10, shape=(1, 2), dtype=float),
-            "others_mask": gymnasium.spaces.Box(0, 1, shape=(2,), dtype=float),
-        }
-    )
+def _multimodal_space(*, include_mask: bool = True) -> gymnasium.spaces.Dict:
+    spaces = {
+        "image": gymnasium.spaces.Box(-10, 10, shape=(1, 3, 3), dtype=float),
+        "ego": gymnasium.spaces.Box(-10, 10, shape=(2,), dtype=float),
+        "other_0": gymnasium.spaces.Box(-10, 10, shape=(1, 2), dtype=float),
+        "other_1": gymnasium.spaces.Box(-10, 10, shape=(1, 2), dtype=float),
+    }
+    if include_mask:
+        spaces["others_mask"] = gymnasium.spaces.Box(0, 1, shape=(2,), dtype=float)
+    return gymnasium.spaces.Dict(spaces)
 
 
 def _multimodal_network(
@@ -1946,6 +1946,47 @@ def test_attention_masked_rows_support_autocast_output_dtype():
 
     assert actions.shape == (2, 2)
     assert torch.isfinite(actions).all()
+
+
+@pytest.mark.parametrize("include_mask", [False, True], ids=["unmasked", "safe-masked"])
+def test_attention_uses_weight_producing_path_for_training_numerics(monkeypatch, include_mask):
+    observation_space = _multimodal_space(include_mask=include_mask)
+    action_space = gymnasium.spaces.Box(-1, 1, shape=(2,))
+    policy = CNNGRUAttentionMLPPolicy(
+        observation_space=observation_space,
+        state_space=observation_space,
+        action_space=action_space,
+        device="cpu",
+        num_envs=2,
+        network=_multimodal_network(sequence_length=1),
+        reduction="sum",
+    )
+    native = {
+        "image": torch.zeros((2, 1, 3, 3)),
+        "ego": torch.zeros((2, 2)),
+        "other_0": torch.zeros((2, 1, 2)),
+        "other_1": torch.zeros((2, 1, 2)),
+    }
+    if include_mask:
+        # Exercise the safe full-batch path with one fully masked row.
+        native["others_mask"] = torch.tensor([[0.0, 0.0], [1.0, 0.0]])
+
+    need_weights_calls = []
+    original_forward = policy.attention.forward
+
+    def record_need_weights(*args, **kwargs):
+        need_weights_calls.append(kwargs.get("need_weights", True))
+        return original_forward(*args, **kwargs)
+
+    monkeypatch.setattr(policy.attention, "forward", record_need_weights)
+    policy.eval()
+    with torch.no_grad():
+        actions, _ = policy.compute(
+            {"observations": flatten_tensorized_space(native)}, role="policy"
+        )
+
+    assert torch.isfinite(actions).all()
+    assert need_weights_calls == [True]
 
 
 def test_separate_feature_projection_bypasses_fusion_and_preserves_gru_input_size():
