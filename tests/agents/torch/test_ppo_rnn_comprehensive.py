@@ -1571,6 +1571,73 @@ def test_packed_gru_reset_batching_matches_legacy_outputs_and_gradients():
     assert torch.count_nonzero(packed_result[1][:, done[:, -1], :]) == 0
 
 
+def test_packed_gru_avoids_pad_cpu_unsort_for_discarded_lengths(monkeypatch):
+    """Keep packed-output restoration on-device when returned lengths are unused."""
+    sequence_count, sequence_length = 4, 6
+    observation_space = _multimodal_space()
+    action_space = gymnasium.spaces.Box(-1, 1, shape=(2,))
+    model = CNNGRUAttentionMLPPolicy(
+        observation_space=observation_space,
+        state_space=observation_space,
+        action_space=action_space,
+        device="cpu",
+        num_envs=sequence_count,
+        network=_multimodal_network(
+            sequence_length, recurrent_batching="packed"
+        ),
+        reduction="sum",
+    )
+    model.train()
+
+    done = torch.zeros((sequence_count, sequence_length), dtype=torch.bool)
+    done[0, 0] = True
+    done[1, 3] = True
+    done[2, 1:3] = True
+    plan = model._build_packed_gru_plan(done)
+    expected_flat_positions = (
+        plan.segment_rows.unsqueeze(1) * sequence_length
+        + plan.safe_segment_steps
+    )[plan.valid_steps]
+    torch.testing.assert_close(plan.flat_positions, expected_flat_positions)
+
+    observed_unsorted_indices = []
+    original_pad_packed_sequence = nn.utils.rnn.pad_packed_sequence
+
+    def capture_pad_input(sequence, *args, **kwargs):
+        observed_unsorted_indices.append(sequence.unsorted_indices)
+        return original_pad_packed_sequence(sequence, *args, **kwargs)
+
+    monkeypatch.setattr(
+        nn.utils.rnn, "pad_packed_sequence", capture_pad_input
+    )
+    features = torch.randn(
+        sequence_count * sequence_length, model.hidden_size
+    )
+    stored_hidden = torch.randn(
+        model.num_layers,
+        sequence_count * sequence_length,
+        model.hidden_size,
+    )
+    output, hidden = model._run_gru(
+        features,
+        {
+            "rnn": [stored_hidden],
+            "terminated": done.reshape(-1, 1),
+        },
+    )
+
+    assert observed_unsorted_indices == [None]
+    assert output.shape == (
+        sequence_count * sequence_length,
+        model.hidden_size,
+    )
+    assert hidden.shape == (
+        model.num_layers,
+        sequence_count,
+        model.hidden_size,
+    )
+
+
 def _run_custom_gru_with_gradients(
     model,
     base_features: torch.Tensor,

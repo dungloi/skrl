@@ -76,6 +76,7 @@ class _PackedGRUBatchPlan(NamedTuple):
     segment_rows: torch.Tensor
     safe_segment_steps: torch.Tensor
     valid_steps: torch.Tensor
+    valid_padded_positions: torch.Tensor
     segment_lengths_cpu: torch.Tensor
     first_segment_ids: torch.Tensor
     flat_positions: torch.Tensor
@@ -440,10 +441,14 @@ class _CNNGRUAttentionMLPCommon:
         segment_steps = segment_starts.unsqueeze(1) + offsets.unsqueeze(0)
         valid_steps = offsets.unsqueeze(0) < segment_lengths.unsqueeze(1)
         safe_segment_steps = segment_steps.clamp_max(sequence_length - 1)
+        valid_padded_positions = valid_steps.flatten().nonzero(as_tuple=True)[0]
         first_segment_ids = (segment_starts == 0).nonzero(as_tuple=True)[0]
-        flat_positions = (
+        flat_position_candidates = (
             segment_rows.unsqueeze(1) * sequence_length + safe_segment_steps
-        )[valid_steps]
+        ).flatten()
+        flat_positions = flat_position_candidates.index_select(
+            0, valid_padded_positions
+        )
 
         last_segment = torch.ones(
             segment_count, dtype=torch.bool, device=segment_rows.device
@@ -458,6 +463,7 @@ class _CNNGRUAttentionMLPCommon:
             segment_rows=segment_rows,
             safe_segment_steps=safe_segment_steps,
             valid_steps=valid_steps,
+            valid_padded_positions=valid_padded_positions,
             segment_lengths_cpu=segment_lengths_cpu,
             first_segment_ids=first_segment_ids,
             flat_positions=flat_positions,
@@ -621,17 +627,35 @@ class _CNNGRUAttentionMLPCommon:
             enforce_sorted=False,
         )
         packed_output, segment_final_hidden = self.gru(packed_input, segment_hidden)
+
+        # ``pad_packed_sequence`` restores both the padded output and the CPU
+        # lengths to their original order. The latter calls
+        # ``packed_output.unsorted_indices.cpu()`` even though this path
+        # discards the lengths, introducing an avoidable device-wide wait.
+        # Pad the sorted packed data, then restore only the output order on the
+        # GPU. ``segment_final_hidden`` is already restored by ``nn.GRU``.
+        sorted_packed_output = nn.utils.rnn.PackedSequence(
+            packed_output.data,
+            packed_output.batch_sizes,
+        )
         padded_output, _ = nn.utils.rnn.pad_packed_sequence(
-            packed_output,
+            sorted_packed_output,
             batch_first=True,
             total_length=plan.max_segment_length,
         )
+        if packed_output.unsorted_indices is not None:
+            padded_output = padded_output.index_select(
+                0, packed_output.unsorted_indices
+            )
 
         flat_output = padded_output.new_zeros(
             sequence_count * sequence_length, self.hidden_size
         )
+        valid_output = padded_output.flatten(0, 1).index_select(
+            0, plan.valid_padded_positions
+        )
         flat_output = flat_output.index_copy(
-            0, plan.flat_positions, padded_output[plan.valid_steps]
+            0, plan.flat_positions, valid_output
         )
         rnn_output = flat_output.view(
             sequence_count, sequence_length, self.hidden_size
